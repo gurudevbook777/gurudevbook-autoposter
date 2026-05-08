@@ -17,6 +17,7 @@ Environment variables required:
   CONTENT_DIR         — path to content/ folder     (default: /app/content)
   SMOKE_TEST_ON_BOOT  — set to "1" for first-boot test message
 """
+PROOFS_CHANNEL = "@gurudevbookproofs"
 
 import asyncio
 import json
