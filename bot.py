@@ -33,6 +33,8 @@ import urllib.error
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.executors.asyncio import AsyncIOExecutor
 import pytz
 from telegram import Update
 from telegram.constants import ParseMode
@@ -51,6 +53,7 @@ REGISTER_URL = os.environ.get("REGISTER_URL", "https://gurudevbook.com/register"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "state.db"
+JOBS_DB_PATH = DATA_DIR / "jobs.sqlite"  # persistent APScheduler jobstore
 
 CONTENT_DIR = Path(os.environ.get("CONTENT_DIR", "/app/content"))
 PREFILL_DIR = CONTENT_DIR / "prefill"
@@ -132,6 +135,18 @@ def init_db():
             sent_at     TEXT,
             message_id  INTEGER
         );
+        CREATE TABLE IF NOT EXISTS fired_jobs_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id      TEXT NOT NULL,
+            fired_at    TEXT NOT NULL,
+            status      TEXT DEFAULT 'ok'  -- 'ok' or 'error'
+        );
+        CREATE TABLE IF NOT EXISTS bot_errors (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            occurred_at TEXT NOT NULL,
+            context     TEXT,
+            error       TEXT
+        );
         """)
 
 def setting_get(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -159,6 +174,41 @@ def already_sent(file: str, cycle: int = 0) -> bool:
         row = c.execute("SELECT 1 FROM sent_posts WHERE file=? AND cycle=?",
                         (file, cycle)).fetchone()
     return row is not None
+
+def log_fired_job(job_id: str, status: str = "ok"):
+    """Record that a job fired (for /status history)."""
+    with db() as c:
+        c.execute("INSERT INTO fired_jobs_log(job_id,fired_at,status) VALUES (?,?,?)",
+                  (job_id, datetime.now(TZ).isoformat(), status))
+    # Keep only last 50 entries
+    with db() as c:
+        c.execute("DELETE FROM fired_jobs_log WHERE id NOT IN "
+                  "(SELECT id FROM fired_jobs_log ORDER BY id DESC LIMIT 50)")
+
+def log_bot_error(context: str, error: str):
+    """Record a bot error for /status display."""
+    with db() as c:
+        c.execute("INSERT INTO bot_errors(occurred_at,context,error) VALUES (?,?,?)",
+                  (datetime.now(TZ).isoformat(), context, error[:500]))
+    with db() as c:
+        c.execute("DELETE FROM bot_errors WHERE id NOT IN "
+                  "(SELECT id FROM bot_errors ORDER BY id DESC LIMIT 10)")
+
+def get_last_error() -> Optional[str]:
+    with db() as c:
+        row = c.execute(
+            "SELECT occurred_at, context, error FROM bot_errors ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        return None
+    return f"{row[0]} | {row[1]}: {row[2]}"
+
+def get_last_fired_jobs(n: int = 5) -> list:
+    with db() as c:
+        rows = c.execute(
+            "SELECT job_id, fired_at, status FROM fired_jobs_log ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+    return rows
 
 # ---------------------------------------------------------------------------
 # CRICKET ENGINE — FIXTURE FETCHING
@@ -503,47 +553,75 @@ async def post_text_to_channel(application, text: str, match_id: str, post_type:
         log.error("Cricket post failed (%s/%s): %s", match_id, post_type, e)
 
 async def cricket_preview_job(application, match_id: str):
-    match = get_match_from_db(match_id)
-    if not match or match["skipped"]:
-        return
-    if setting_get("cricket_paused") == "1":
-        return
-    caption = make_preview_caption(match)
-    await post_text_to_channel(application, caption, match_id, "preview")
+    job_id = f"cricket_preview::{match_id}"
+    try:
+        match = get_match_from_db(match_id)
+        if not match or match["skipped"]:
+            return
+        if setting_get("cricket_paused") == "1":
+            return
+        caption = make_preview_caption(match)
+        await post_text_to_channel(application, caption, match_id, "preview")
+        log_fired_job(job_id, "ok")
+    except Exception as e:
+        log.error("Cricket preview job failed for %s: %s", match_id, e)
+        log_fired_job(job_id, "error")
+        log_bot_error(job_id, str(e))
 
 async def cricket_combo_job(application, match_id: str):
-    match = get_match_from_db(match_id)
-    if not match or match["skipped"]:
-        return
-    if setting_get("cricket_paused") == "1":
-        return
-    caption = make_combo_caption(match)
-    await post_text_to_channel(application, caption, match_id, "combo")
+    job_id = f"cricket_combo::{match_id}"
+    try:
+        match = get_match_from_db(match_id)
+        if not match or match["skipped"]:
+            return
+        if setting_get("cricket_paused") == "1":
+            return
+        caption = make_combo_caption(match)
+        await post_text_to_channel(application, caption, match_id, "combo")
+        log_fired_job(job_id, "ok")
+    except Exception as e:
+        log.error("Cricket combo job failed for %s: %s", match_id, e)
+        log_fired_job(job_id, "error")
+        log_bot_error(job_id, str(e))
 
 async def cricket_live_alert_job(application, match_id: str):
-    match = get_match_from_db(match_id)
-    if not match or match["skipped"]:
-        return
-    if setting_get("cricket_paused") == "1":
-        return
-    caption = make_live_alert_caption(match)
-    await post_text_to_channel(application, caption, match_id, "live_alert")
+    job_id = f"cricket_live::{match_id}"
+    try:
+        match = get_match_from_db(match_id)
+        if not match or match["skipped"]:
+            return
+        if setting_get("cricket_paused") == "1":
+            return
+        caption = make_live_alert_caption(match)
+        await post_text_to_channel(application, caption, match_id, "live_alert")
+        log_fired_job(job_id, "ok")
+    except Exception as e:
+        log.error("Cricket live alert job failed for %s: %s", match_id, e)
+        log_fired_job(job_id, "error")
+        log_bot_error(job_id, str(e))
 
 async def cricket_recap_job(application, match_id: str):
     """
     Fires ~2 hours after match start. Checks if admin sent /win or /loss.
     If not, posts neutral recap.
     """
-    match = get_match_from_db(match_id)
-    if not match or match["skipped"]:
-        return
-    if cricket_post_already_sent(match_id, "recap"):
-        return
-    if setting_get("cricket_paused") == "1":
-        return
-    result = match.get("tip_result")  # "win", "loss", or None
-    caption = make_recap_caption(match, result)
-    await post_text_to_channel(application, caption, match_id, "recap")
+    job_id = f"cricket_recap::{match_id}"
+    try:
+        match = get_match_from_db(match_id)
+        if not match or match["skipped"]:
+            return
+        if cricket_post_already_sent(match_id, "recap"):
+            return
+        if setting_get("cricket_paused") == "1":
+            return
+        result = match.get("tip_result")  # "win", "loss", or None
+        caption = make_recap_caption(match, result)
+        await post_text_to_channel(application, caption, match_id, "recap")
+        log_fired_job(job_id, "ok")
+    except Exception as e:
+        log.error("Cricket recap job failed for %s: %s", match_id, e)
+        log_fired_job(job_id, "error")
+        log_bot_error(job_id, str(e))
 
 def schedule_cricket_match(application, sched: AsyncIOScheduler, match: dict):
     """Add 4 jobs for a single match: preview, combo, live alert, recap."""
@@ -723,52 +801,66 @@ async def send_post(application, file_path: Path, caption: str,
         return None
 
 async def post_prefill_job(application, file_name: str):
-    if already_sent(file_name, cycle=0):
-        log.info("Skip %s — already sent", file_name)
-        return
-    if setting_get("paused") == "1":
-        log.info("Paused — skipping prefill %s", file_name)
-        return
-    pre_caps, _ = load_captions()
-    caption = pre_caps.get(file_name, f"GurudevBook Official — {file_name}")
-    pin = file_name in PIN_FILES
-    msg_id = await send_post(application, PREFILL_DIR / file_name, caption,
-                             pin=pin, log_label="PREFILL")
-    if msg_id:
-        mark_sent(file_name, msg_id, cycle=0)
+    job_id = f"prefill::{file_name}"
+    try:
+        if already_sent(file_name, cycle=0):
+            log.info("Skip %s — already sent", file_name)
+            return
+        if setting_get("paused") == "1":
+            log.info("Paused — skipping prefill %s", file_name)
+            return
+        pre_caps, _ = load_captions()
+        caption = pre_caps.get(file_name, f"GurudevBook Official — {file_name}")
+        pin = file_name in PIN_FILES
+        msg_id = await send_post(application, PREFILL_DIR / file_name, caption,
+                                 pin=pin, log_label="PREFILL")
+        if msg_id:
+            mark_sent(file_name, msg_id, cycle=0)
+            log_fired_job(job_id, "ok")
+    except Exception as e:
+        log.error("Prefill job failed for %s: %s", file_name, e)
+        log_fired_job(job_id, "error")
+        log_bot_error(job_id, str(e))
 
 async def post_calendar_slot(application, slot_hh_mm):
-    if setting_get("paused") == "1":
-        log.info("Paused — skipping calendar slot %s", slot_hh_mm)
-        return
-    sent_count = 0
-    with db() as c:
-        sent_count = c.execute("SELECT COUNT(*) FROM sent_posts "
-                               "WHERE cycle=0").fetchone()[0]
-    if sent_count < len(list_prefill_in_order()):
-        log.info("Pre-fill not finished (%d/30) — skipping calendar slot",
-                 sent_count)
-        return
-    if not setting_get("calendar_start_date"):
-        setting_set("calendar_start_date",
-                    datetime.now(TZ).date().isoformat())
-    file_name = pick_calendar_file(slot_hh_mm)
-    if not file_name:
-        log.warning("No calendar file for slot %s on day %d",
-                    slot_hh_mm, current_cycle_day())
-        return
-    cycle = (datetime.now(TZ).date() -
-             datetime.fromisoformat(setting_get("calendar_start_date"))
-             .date()).days // 7 + 1
-    if already_sent(file_name, cycle=cycle):
-        log.info("Calendar %s already sent in cycle %d", file_name, cycle)
-        return
-    _, cal_caps = load_captions()
-    caption = cal_caps.get(file_name, f"GurudevBook Official — {file_name}")
-    msg_id = await send_post(application, CALENDAR_DIR / file_name, caption,
-                             pin=False, log_label=f"CAL D{current_cycle_day()}")
-    if msg_id:
-        mark_sent(file_name, msg_id, cycle=cycle)
+    job_id = f"cal::{slot_hh_mm[0]:02d}{slot_hh_mm[1]:02d}"
+    try:
+        if setting_get("paused") == "1":
+            log.info("Paused — skipping calendar slot %s", slot_hh_mm)
+            return
+        sent_count = 0
+        with db() as c:
+            sent_count = c.execute("SELECT COUNT(*) FROM sent_posts "
+                                   "WHERE cycle=0").fetchone()[0]
+        if sent_count < len(list_prefill_in_order()):
+            log.info("Pre-fill not finished (%d/30) — skipping calendar slot",
+                     sent_count)
+            return
+        if not setting_get("calendar_start_date"):
+            setting_set("calendar_start_date",
+                        datetime.now(TZ).date().isoformat())
+        file_name = pick_calendar_file(slot_hh_mm)
+        if not file_name:
+            log.warning("No calendar file for slot %s on day %d",
+                        slot_hh_mm, current_cycle_day())
+            return
+        cycle = (datetime.now(TZ).date() -
+                 datetime.fromisoformat(setting_get("calendar_start_date"))
+                 .date()).days // 7 + 1
+        if already_sent(file_name, cycle=cycle):
+            log.info("Calendar %s already sent in cycle %d", file_name, cycle)
+            return
+        _, cal_caps = load_captions()
+        caption = cal_caps.get(file_name, f"GurudevBook Official — {file_name}")
+        msg_id = await send_post(application, CALENDAR_DIR / file_name, caption,
+                                 pin=False, log_label=f"CAL D{current_cycle_day()}")
+        if msg_id:
+            mark_sent(file_name, msg_id, cycle=cycle)
+            log_fired_job(job_id, "ok")
+    except Exception as e:
+        log.error("Calendar job failed for %s: %s", slot_hh_mm, e)
+        log_fired_job(job_id, "error")
+        log_bot_error(job_id, str(e))
 
 # ---------------------------------------------------------------------------
 # ADMIN COMMANDS
@@ -829,20 +921,43 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                   key=lambda j: j.next_run_time or datetime.max.replace(tzinfo=TZ))
     paused = setting_get("paused") == "1"
     cricket_paused = setting_get("cricket_paused") == "1"
-    lines = []
+    
+    lines = ["*GurudevBook Bot Status*"]
+    lines.append(f"Time: {datetime.now(TZ).strftime('%H:%M:%S %Z')}")
+    
     if paused:
-        lines.append("STATUS: PAUSED (all posts)")
+        lines.append("Mode: ⏸ PAUSED (all posts)")
     elif cricket_paused:
-        lines.append("STATUS: Cricket posts PAUSED (fallback active)")
+        lines.append("Mode: 🏏 Cricket PAUSED (fallback active)")
     else:
-        lines.append("STATUS: Active")
-    lines.append(f"Total scheduled jobs: {len(jobs)}")
-    lines.append("Next 5:")
-    for j in jobs[:5]:
-        nrt = j.next_run_time
-        if nrt:
-            lines.append(f"  {nrt.astimezone(TZ).strftime('%a %d %b %H:%M')} — {j.id}")
-    await update.message.reply_text("\n".join(lines))
+        lines.append("Mode: ✅ Active")
+    
+    lines.append(f"\n*Job Queue ({len(jobs)} total):*")
+    if not jobs:
+        lines.append("  (No jobs scheduled)")
+    else:
+        for j in jobs[:5]:
+            nrt = j.next_run_time
+            if nrt:
+                lines.append(f"  \u231b {nrt.astimezone(TZ).strftime('%H:%M')} \u2014 {j.id}")
+            else:
+                lines.append(f"  \u231b (paused) \u2014 {j.id}")
+
+    # History
+    history = get_last_fired_jobs(5)
+    if history:
+        lines.append("\n*Last 5 Fired:*")
+        for jid, fat, stat in history:
+            ts = datetime.fromisoformat(fat).astimezone(TZ).strftime('%H:%M')
+            icon = "✅" if stat == "ok" else "❌"
+            lines.append(f"  {icon} {ts} \u2014 {jid}")
+
+    # Errors
+    last_err = get_last_error()
+    if last_err:
+        lines.append(f"\n*Last Error:*\n`{last_err}`")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id):
@@ -1259,7 +1374,23 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # SCHEDULER WIRING
 # ---------------------------------------------------------------------------
 def build_scheduler(application) -> AsyncIOScheduler:
-    sched = AsyncIOScheduler(timezone=TZ)
+    jobstores = {
+        'default': SQLAlchemyJobStore(url=f'sqlite:///{JOBS_DB_PATH}')
+    }
+    executors = {
+        'default': AsyncIOExecutor()
+    }
+    job_defaults = {
+        'coalesce': False,
+        'max_instances': 3,
+        'misfire_grace_time': 600  # 10 minute grace for missed jobs on boot
+    }
+    sched = AsyncIOScheduler(
+        jobstores=jobstores,
+        executors=executors,
+        job_defaults=job_defaults,
+        timezone=TZ
+    )
 
     # 1) Pre-fill rollout (one-shot dated jobs)
     plan = prefill_schedule()
@@ -1283,6 +1414,8 @@ def build_scheduler(application) -> AsyncIOScheduler:
         log.info("Scheduled daily calendar slot %02d:%02d IST", hh, mm)
 
     # 3) Daily cricket fixture fetch at 07:00 IST
+    # This is a self-healing safety net: it re-fetches, updates DB, and re-schedules.
+    # replace_existing=True in add_job handles the deduplication.
     sched.add_job(
         daily_cricket_fetch_job, CronTrigger(hour=7, minute=0, timezone=TZ),
         args=[application], id="cricket_daily_fetch",
@@ -1301,21 +1434,35 @@ async def post_init(application):
     sched.start()
     application.bot_data["scheduler"] = sched
 
-    # Smoke test
-    if os.environ.get("SMOKE_TEST_ON_BOOT") == "1" and \
-       setting_get("smoke_done") != "1":
+    # Admin notification on boot
+    admin_id = setting_get("admin_chat_id")
+    if admin_id:
         try:
-            now_str = datetime.now(TZ).strftime("%H:%M IST on %d %b %Y")
-            msg = await application.bot.send_message(
-                chat_id=CHANNEL,
-                text=(f"GurudevBook auto-poster v2.0 is LIVE.\n"
-                      f"Cricket engine active — daily fetch at 07:00 IST.\n"
-                      f"Boot time: {now_str}"))
-            setting_set("smoke_done", "1")
-            log.info("Smoke test message sent (msg_id=%s). "
-                     "Delete it from the channel manually.", msg.message_id)
+            jobs = sorted(sched.get_jobs(),
+                          key=lambda j: j.next_run_time or datetime.max.replace(tzinfo=TZ))
+            now_str = datetime.now(TZ).strftime("%H:%M IST")
+            
+            lines = [f"🚀 *GurudevBook Bot v2.1 Rebooted*"]
+            lines.append(f"Time: {now_str}")
+            lines.append(f"Active jobs in queue: {len(jobs)}")
+            
+            if jobs:
+                lines.append("\n*Next 3 upcoming:*")
+                for j in jobs[:3]:
+                    nrt = j.next_run_time
+                    if nrt:
+                        lines.append(f" \u231b {nrt.astimezone(TZ).strftime('%H:%M')} \u2014 {j.id}")
+            
+            # Note: misfire_grace_time handles recovery automatically
+            lines.append("\n_Persistent JobStore active. Missed jobs (within 10m) will fire automatically._")
+            
+            await application.bot.send_message(
+                chat_id=int(admin_id),
+                text="\n".join(lines),
+                parse_mode=ParseMode.MARKDOWN
+            )
         except Exception as e:
-            log.error("Smoke test failed: %s", e)
+            log.error("Boot admin notification failed: %s", e)
 
     # Run cricket fetch on EVERY boot so DB is never empty after redeploy
     log.info("Running cricket fetch on boot (every startup)...")
@@ -1358,7 +1505,8 @@ def main():
                                            on_text))
 
     log.info("GurudevBook bot v2.0 starting. Channel=%s TZ=%s", CHANNEL, TZ_NAME)
-    application.run_polling(drop_pending_updates=True,
+    # drop_pending_updates=False so messages sent during a redeploy are NOT silently discarded
+    application.run_polling(drop_pending_updates=False,
                             allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
