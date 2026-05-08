@@ -1002,12 +1002,42 @@ async def cmd_forcematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id):
         return
     text = " ".join(ctx.args) if ctx.args else ""
-    # Parse: "Team1 vs Team2 @ HH:MM"
+
+    # If no arguments given, re-trigger Cricbuzz fetch and schedule all today's matches
+    if not text.strip():
+        await update.message.reply_text(
+            "Koi match manually specify nahi kiya. Cricbuzz se aaj ke matches re-fetch kar raha hoon..."
+        )
+        sched: AsyncIOScheduler = ctx.application.bot_data.get("scheduler")
+        matches = fetch_today_matches()
+        if not matches:
+            await update.message.reply_text(
+                "Aaj Cricbuzz par koi relevant match nahi mila. Manually add karne ke liye:\n"
+                "/forcematch Team1 vs Team2 @ HH:MM"
+            )
+            return
+        total_jobs = 0
+        lines = [f"Cricbuzz se {len(matches)} match(es) mila:\n"]
+        for match in matches:
+            save_match_to_db(match)
+            jobs = schedule_cricket_match(ctx.application, sched, match) if sched else 0
+            total_jobs += jobs
+            lines.append(
+                f"  {match['team1']} vs {match['team2']} @ "
+                f"{match['start_dt_ist'].strftime('%I:%M %p IST')} "
+                f"— {jobs} posts scheduled"
+            )
+        lines.append(f"\nTotal posts queued: {total_jobs}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # Parse manual entry: "Team1 vs Team2 @ HH:MM"
     m = re.match(r"(.+?)\s+vs\s+(.+?)\s+@\s+(\d{1,2}):(\d{2})", text, re.IGNORECASE)
     if not m:
         await update.message.reply_text(
             "Format: /forcematch Team1 vs Team2 @ HH:MM\n"
-            "Example: /forcematch IND vs PAK @ 19:30"
+            "Example: /forcematch IND vs PAK @ 19:30\n\n"
+            "Ya sirf /forcematch bhejo aur bot aaj ke matches Cricbuzz se auto-fetch karega."
         )
         return
     t1, t2, hh, mm = m.group(1).strip(), m.group(2).strip(), int(m.group(3)), int(m.group(4))
