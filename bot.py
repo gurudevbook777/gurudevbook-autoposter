@@ -1009,7 +1009,7 @@ async def cmd_forcematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Koi match manually specify nahi kiya. Cricbuzz se aaj ke matches re-fetch kar raha hoon..."
         )
         sched: AsyncIOScheduler = ctx.application.bot_data.get("scheduler")
-        matches = fetch_today_matches()
+        matches = fetch_today_cricket_matches()
         if not matches:
             await update.message.reply_text(
                 "Aaj Cricbuzz par koi relevant match nahi mila. Manually add karne ke liye:\n"
@@ -1173,11 +1173,12 @@ async def post_init(application):
         except Exception as e:
             log.error("Smoke test failed: %s", e)
 
-    # Run cricket fetch immediately on first boot (so today's matches are loaded)
-    if setting_get("first_cricket_fetch_done") != "1":
-        log.info("Running initial cricket fetch on boot...")
+    # Run cricket fetch on EVERY boot so DB is never empty after redeploy
+    log.info("Running cricket fetch on boot (every startup)...")
+    try:
         await daily_cricket_fetch_job(application)
-        setting_set("first_cricket_fetch_done", "1")
+    except Exception as e:
+        log.error("Boot cricket fetch failed: %s", e)
 
 def main():
     application = (Application.builder()
