@@ -18,6 +18,8 @@ Environment variables required:
   SMOKE_TEST_ON_BOOT  — set to "1" for first-boot test message
 """
 PROOFS_CHANNEL = "@gurudevbookproofs"
+WHATSAPP_LINK = "https://wa.me/918058055607"
+WHATSAPP_PHONE = "+91 80580 55607"
 
 import asyncio
 import json
@@ -67,13 +69,26 @@ JOBS_DB_PATH = DATA_DIR / "jobs.sqlite"  # persistent APScheduler jobstore
 CONTENT_DIR = Path(os.environ.get("CONTENT_DIR", "/app/content"))
 PREFILL_DIR = CONTENT_DIR / "prefill"
 CALENDAR_DIR = CONTENT_DIR / "calendar"
+CRICKET_DIR = CONTENT_DIR / "cricket"
+PROOFS_DIR = CONTENT_DIR / "proofs"
 CAPTIONS_FILE = CONTENT_DIR / "captions.json"
+PROOFS_QUEUE_FILE = CONTENT_DIR / "proofs_queue.json"
 
-PIN_FILES = {"26_warning_fake_channels.png", "30_founder_intro.png"}
+PIN_FILES = {"02_warning_fake_channels.png", "06_founder_intro.png"}
 
 SLOTS = [(10, 0), (13, 0), (18, 0), (21, 30)]
 PREFILL_ROLLOUT_DAYS = 3
-PREFILL_PER_DAY = [12, 12, 6]
+PREFILL_PER_DAY = [2, 2, 2]
+
+# Cricket poster rotation — 3 templates baked into content/cricket/
+CRICKET_VARIANTS = ["variant1.png", "variant3.png", "variant4.png"]
+CRICKET_VARIANT_NAMES = ["V1 Play Big / Win Big", "V3 Versus Showdown", "V4 Live Now"]
+CRICKET_DIR_NAME = "cricket"
+
+# Real proofs queue (separate channel)
+PROOFS_QUEUE_FILE_NAME = "proofs_queue.json"
+PROOFS_DIR_NAME = "proofs"
+PROOFS_SLOTS = [(11, 0), (17, 0), (22, 0)]   # IST slots for proofs channel
 
 SLOT_TIME_MAP = {
     "1000": (10, 0),
@@ -155,6 +170,11 @@ def init_db():
             occurred_at TEXT NOT NULL,
             context     TEXT,
             error       TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sent_proofs (
+            file        TEXT PRIMARY KEY,
+            sent_at     TEXT NOT NULL,
+            message_id  INTEGER
         );
         """)
 
@@ -443,6 +463,15 @@ def _simple_tip_pick(team1: str, team2: str) -> tuple[str, str]:
     # Fallback: pick team1
     return team1, "current form aur head-to-head record"
 
+def cricket_variant_for_today(d: Optional[datetime] = None) -> tuple[int, str, str]:
+    """Return (index, filename, human_name) for today's cricket poster variant.
+    Rotation: day_of_year % 3 → V1 / V3 / V4.
+    """
+    if d is None:
+        d = datetime.now(TZ)
+    idx = d.timetuple().tm_yday % len(CRICKET_VARIANTS)
+    return idx, CRICKET_VARIANTS[idx], CRICKET_VARIANT_NAMES[idx]
+
 def make_preview_caption(match: dict) -> str:
     t1 = _team_display(match["team1"].split()[0])
     t2 = _team_display(match["team2"].split()[0])
@@ -462,7 +491,8 @@ def make_preview_caption(match: dict) -> str:
         f"VIP combo pick aaj match se 30 min pehle is channel par drop hoga. "
         f"Channel UNMUTE rakho!\n\n"
         f"Abhi register karo — 100% welcome bonus + 1 free VIP tip:\n"
-        f"{REGISTER_URL}\n\n"
+        f"{REGISTER_URL}\n"
+        f"WhatsApp: {WHATSAPP_LINK}\n\n"
         f"#GurudevBook #{t1.replace(' ','')} #{t2.replace(' ','')} "
         f"#VIPTipper #CricketTips"
     )
@@ -486,7 +516,8 @@ def make_combo_caption(match: dict) -> str:
         f"Disclaimer: Ye analysis sirf entertainment aur information ke liye hai. "
         f"Responsible gaming karein. 18+ only.\n\n"
         f"Full VIP analysis + odds breakdown ke liye register karein:\n"
-        f"{REGISTER_URL}\n\n"
+        f"{REGISTER_URL}\n"
+        f"WhatsApp: {WHATSAPP_LINK}\n\n"
         f"#VIPCombo #GurudevBook #{t1.replace(' ','')}vs{t2.replace(' ','')} "
         f"#CricketTips #WinWithGurudev"
     )
@@ -499,7 +530,8 @@ def make_live_alert_caption(match: dict) -> str:
         f"Match shuru ho gaya! Apni ID login karo aur enjoy karo.\n\n"
         f"Live updates aur score ke liye channel follow karte raho.\n"
         f"Abhi tak register nahi kiya? Jaldi karo:\n"
-        f"{REGISTER_URL}\n\n"
+        f"{REGISTER_URL}\n"
+        f"WhatsApp: {WHATSAPP_LINK}\n\n"
         f"#LiveNow #GurudevBook #{t1.replace(' ','')}vs{t2.replace(' ','')} "
         f"#CricketLive"
     )
@@ -516,7 +548,8 @@ def make_recap_caption(match: dict, result: Optional[str] = None) -> str:
             f"Bhaiyo, aaj ke VIP members ne mast return banaya. "
             f"Kal ka combo bhi is channel par aayega.\n\n"
             f"Abhi tak join nahi kiya? Kal miss mat karo:\n"
-            f"{REGISTER_URL}\n\n"
+            f"{REGISTER_URL}\n"
+            f"WhatsApp: {WHATSAPP_LINK}\n\n"
             f"#TipHit #GurudevBook #WinWithGurudev "
             f"#{t1.replace(' ','')}vs{t2.replace(' ','')} #VIPLife"
         )
@@ -528,7 +561,8 @@ def make_recap_caption(match: dict, result: Optional[str] = None) -> str:
             f"Hamari team kal fresh analysis ke saath wapas aayegi. "
             f"Long-term mein consistency hi winner banati hai.\n\n"
             f"Responsible gaming karein. 18+ only.\n"
-            f"Register: {REGISTER_URL}\n\n"
+            f"Register: {REGISTER_URL}\n"
+            f"WhatsApp: {WHATSAPP_LINK}\n\n"
             f"#GurudevBook #HonestTipper "
             f"#{t1.replace(' ','')}vs{t2.replace(' ','')} #CricketAnalysis"
         )
@@ -539,7 +573,8 @@ def make_recap_caption(match: dict, result: Optional[str] = None) -> str:
             f"Match khatam ho gaya. Full result aur analysis kal subah "
             f"channel par share kiya jayega.\n\n"
             f"Daily VIP tips ke liye channel subscribe karein:\n"
-            f"{REGISTER_URL}\n\n"
+            f"{REGISTER_URL}\n"
+            f"WhatsApp: {WHATSAPP_LINK}\n\n"
             f"#GurudevBook #{t1.replace(' ','')}vs{t2.replace(' ','')} "
             f"#CricketResults"
         )
@@ -548,19 +583,33 @@ def make_recap_caption(match: dict, result: Optional[str] = None) -> str:
 # CRICKET SCHEDULER
 # ---------------------------------------------------------------------------
 async def post_text_to_channel(text: str, match_id: str, post_type: str):
-    """Send a text-only post to the channel and record it."""
+    """Send a cricket post to the channel and record it. If today's poster
+    variant exists in content/cricket/, send as photo with caption; otherwise
+    fall back to text-only message.
+    """
     application = _APP
     if cricket_post_already_sent(match_id, post_type):
         log.info("Cricket post %s/%s already sent", match_id, post_type)
         return
     try:
-        msg = await application.bot.send_message(
-            chat_id=CHANNEL, text=text, disable_web_page_preview=True
-        )
+        # Try poster image (rotation V1/V3/V4)
+        _, variant_file, _ = cricket_variant_for_today()
+        poster_path = CRICKET_DIR / variant_file
+        if poster_path.exists():
+            with open(poster_path, "rb") as fh:
+                msg = await application.bot.send_photo(
+                    chat_id=CHANNEL, photo=fh, caption=text
+                )
+        else:
+            msg = await application.bot.send_message(
+                chat_id=CHANNEL, text=text, disable_web_page_preview=True
+            )
         mark_cricket_post_sent(match_id, post_type, msg.message_id)
-        log.info("[CRICKET %s] match=%s msg_id=%s", post_type, match_id, msg.message_id)
+        log.info("[CRICKET %s] match=%s msg_id=%s variant=%s",
+                 post_type, match_id, msg.message_id, variant_file)
     except Exception as e:
         log.error("Cricket post failed (%s/%s): %s", match_id, post_type, e)
+        log_bot_error(f"cricket_post::{post_type}::{match_id}", str(e))
 
 async def cricket_preview_job(match_id: str):
     job_id = f"cricket_preview::{match_id}"
@@ -721,6 +770,80 @@ async def daily_cricket_fetch_job():
         count += jobs
 
     log.info("Cricket fetch done: %d matches, %d jobs scheduled", len(matches), count)
+
+# ---------------------------------------------------------------------------
+# REAL PROOFS QUEUE — separate channel @gurudevbookproofs, no-repeat tracker
+# ---------------------------------------------------------------------------
+def load_proofs_queue() -> list[dict]:
+    """Load the linear queue of proofs from content/proofs_queue.json.
+    Returns a flat list of slot dicts: {time, file, type, caption}.
+    """
+    if not PROOFS_QUEUE_FILE.exists():
+        log.warning("proofs_queue.json missing — proofs channel will not post")
+        return []
+    try:
+        data = json.loads(PROOFS_QUEUE_FILE.read_text())
+        flat = []
+        for day in data:
+            for slot in day.get("slots", []):
+                flat.append(slot)
+        return flat
+    except Exception as e:
+        log.error("Failed to parse proofs_queue.json: %s", e)
+        return []
+
+def proof_already_sent(file: str) -> bool:
+    with db() as c:
+        row = c.execute("SELECT 1 FROM sent_proofs WHERE file=?", (file,)).fetchone()
+    return row is not None
+
+def mark_proof_sent(file: str, message_id: int):
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO sent_proofs(file, sent_at, message_id) "
+                  "VALUES (?, ?, ?)", (file, datetime.now(TZ).isoformat(), message_id))
+
+def next_unsent_proof() -> Optional[dict]:
+    """Return the next proof slot whose file hasn't been sent yet."""
+    queue = load_proofs_queue()
+    for slot in queue:
+        if not proof_already_sent(slot["file"]):
+            return slot
+    return None
+
+async def post_proof_job(slot_hh_mm):
+    """Post one proof to @gurudevbookproofs at the given slot. Picks the
+    next unsent proof in the queue (no repeats)."""
+    application = _APP
+    job_id = f"proof::{slot_hh_mm[0]:02d}{slot_hh_mm[1]:02d}"
+    try:
+        if setting_get("paused") == "1":
+            log.info("Paused — skipping proof slot %s", slot_hh_mm)
+            return
+        slot = next_unsent_proof()
+        if not slot:
+            log.info("No unsent proofs left in queue — skipping slot %s", slot_hh_mm)
+            return
+        proof_path = PROOFS_DIR / slot["file"]
+        if not proof_path.exists():
+            log.warning("Proof file missing: %s", proof_path)
+            log_bot_error(job_id, f"missing proof file {slot['file']}")
+            return
+        # Append WhatsApp link if not already present in caption
+        caption = slot.get("caption", "").strip()
+        if WHATSAPP_LINK not in caption:
+            caption = f"{caption}\nWhatsApp: {WHATSAPP_LINK}"
+        with open(proof_path, "rb") as fh:
+            msg = await application.bot.send_photo(
+                chat_id=PROOFS_CHANNEL, photo=fh, caption=caption
+            )
+        mark_proof_sent(slot["file"], msg.message_id)
+        log.info("[PROOF] file=%s slot=%s msg_id=%s",
+                 slot["file"], slot_hh_mm, msg.message_id)
+        log_fired_job(job_id, "ok")
+    except Exception as e:
+        log.error("Proof job failed for slot %s: %s", slot_hh_mm, e)
+        log_fired_job(job_id, "error")
+        log_bot_error(job_id, str(e))
 
 # ---------------------------------------------------------------------------
 # CONTENT LOADER (unchanged from v1)
@@ -1074,9 +1197,7 @@ async def cmd_win(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     match = get_match_from_db(match_id)
     if match:
         caption = make_recap_caption(match, "win")
-        await post_text_to_channel(
-            update.get_bot() or ctx.application, caption, match_id, "recap"
-        )
+        await post_text_to_channel(caption, match_id, "recap")
         await update.message.reply_text(
             f"Win marked for {match_id}. Recap post sent to channel!")
     else:
@@ -1096,9 +1217,7 @@ async def cmd_loss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     match = get_match_from_db(match_id)
     if match:
         caption = make_recap_caption(match, "loss")
-        await post_text_to_channel(
-            update.get_bot() or ctx.application, caption, match_id, "recap"
-        )
+        await post_text_to_channel(caption, match_id, "recap")
         await update.message.reply_text(
             f"Loss marked for {match_id}. Recap post sent to channel.")
     else:
@@ -1211,7 +1330,8 @@ AUTO_REPLIES = {
         f"\u2022 *Free morning tip:* Daily 10:00 AM IST par {CHANNEL}\n"
         f"\u2022 *VIP combo pick:* Match se 30 min pehle (members only)\n"
         f"\u2022 *Live alerts + recap:* Match ke time par\n\n"
-        f"Paid VIP join karne ke liye register karo aur pehla deposit kar lo:\n{REGISTER_URL}" + DISCLAIMER
+        f"Paid VIP join karne ke liye register karo aur pehla deposit kar lo:\n{REGISTER_URL}\n"
+        f"WhatsApp ID: {WHATSAPP_LINK}" + DISCLAIMER
     ),
     # ---- CASINO ----
     "casino": (
@@ -1220,7 +1340,8 @@ AUTO_REPLIES = {
         f"\u2022 *Aviator* (crash game, fast cashouts)\n"
         f"\u2022 *Dragon Tiger* (1 round = 30 sec)\n"
         f"\u2022 *Roulette* (European + Lightning)\n\n"
-        f"Naye members ko 100% welcome bonus milta hai. Register karo:\n{REGISTER_URL}" + DISCLAIMER
+        f"Naye members ko 100% welcome bonus milta hai. Register karo:\n{REGISTER_URL}\n"
+        f"WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
     # ---- BONUS ----
     "bonus": (
@@ -1228,7 +1349,8 @@ AUTO_REPLIES = {
         f"\u2022 *Welcome Bonus:* 100% up to \u20B910,000 on first deposit\n"
         f"\u2022 *Reload Bonus:* 25% on every deposit \u20B91000+\n"
         f"\u2022 *Refer & Earn:* \u20B9500 per active referral\n\n"
-        f"Claim karo:\n{REGISTER_URL}" + DISCLAIMER
+        f"Claim karo:\n{REGISTER_URL}\n"
+        f"WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
     # ---- VIP ----
     "vip": (
@@ -1238,11 +1360,14 @@ AUTO_REPLIES = {
         f"\u2022 Casino exclusive bonuses\n"
         f"\u2022 Priority support + faster withdrawal\n"
         f"\u2022 Private VIP group access\n\n"
-        f"Upgrade simple hai \u2014 register karo aur pehla deposit complete karo:\n{REGISTER_URL}" + DISCLAIMER
+        f"Upgrade simple hai \u2014 register karo aur pehla deposit complete karo:\n{REGISTER_URL}\n"
+        f"WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
     # ---- SUPPORT ----
     "support": (
         f"*SUPPORT 24x7*\n\n"
+        f"\u2022 *WhatsApp (fastest):* {WHATSAPP_LINK}\n"
+        f"\u2022 *Phone:* {WHATSAPP_PHONE}\n"
         f"\u2022 *Telegram:* DM is bot ko, agent jaldi reply karega\n"
         f"\u2022 *Email:* support@gurudevbook.com\n"
         f"\u2022 *FAQ:* https://gurudevbook.com/faq\n\n"
@@ -1254,7 +1379,8 @@ AUTO_REPLIES = {
         f"*WINNER PROOFS*\n\n"
         f"Daily withdrawal screenshots aur client chats hamare proofs channel par live hain:\n"
         f"{PROOFS_CHANNEL}\n\n"
-        f"Apni jeet bhi join karo:\n{REGISTER_URL}" + DISCLAIMER
+        f"Apni jeet bhi join karo:\n{REGISTER_URL}\n"
+        f"WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
     # ---- REGISTER ----
     "register": (
@@ -1262,7 +1388,8 @@ AUTO_REPLIES = {
         f"1\ufe0f\u20E3 Open: {REGISTER_URL}\n"
         f"2\ufe0f\u20E3 Apna mobile number + email enter karo\n"
         f"3\ufe0f\u20E3 First deposit karo aur 100% bonus claim karo\n\n"
-        f"Confirmation ke baad apna username yahan bhej do for VIP access." + DISCLAIMER
+        f"Confirmation ke baad apna username yahan bhej do for VIP access.\n"
+        f"Need help? WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
     # ---- WITHDRAW ----
     "withdraw": (
@@ -1270,7 +1397,8 @@ AUTO_REPLIES = {
         f"\u2022 *Time:* 7\u201310 minutes\n"
         f"\u2022 *Methods:* UPI / IMPS / NEFT\n"
         f"\u2022 *Min:* \u20B9100  |  *Max:* \u20B92,00,000 per day\n\n"
-        f"KYC complete hai toh withdrawal approve auto-trigger ho jata hai.\n{REGISTER_URL}" + DISCLAIMER
+        f"KYC complete hai toh withdrawal approve auto-trigger ho jata hai.\n{REGISTER_URL}\n"
+        f"WhatsApp support: {WHATSAPP_LINK}" + DISCLAIMER
     ),
     # ---- DEPOSIT ----
     "deposit": (
@@ -1278,7 +1406,8 @@ AUTO_REPLIES = {
         f"\u2022 *Min:* \u20B9100\n"
         f"\u2022 *Methods:* UPI / Net Banking / Crypto\n"
         f"\u2022 *Bonus:* 100% match on first deposit\n\n"
-        f"Deposit page:\n{REGISTER_URL}" + DISCLAIMER
+        f"Deposit page:\n{REGISTER_URL}\n"
+        f"WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
 }
 
@@ -1301,7 +1430,8 @@ USER_HELP_TEXT = (
     "/withdraw \u2014 withdrawal info\n"
     "/proofs \u2014 winner proofs channel\n"
     "/support \u2014 contact support\n\n"
-    f"Channel: {CHANNEL}  |  Proofs: {PROOFS_CHANNEL}"
+    f"Channel: {CHANNEL}  |  Proofs: {PROOFS_CHANNEL}\n"
+    f"WhatsApp: {WHATSAPP_LINK}  |  {WHATSAPP_PHONE}"
 )
 
 # In-memory rate limiter: {(user_id, keyword): last_sent_unix_ts}
@@ -1385,7 +1515,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Namaste! GurudevBook me aapka swagat hai.\n\n"
             f"Type karo: tips, casino, bonus, vip, register, withdraw, support\n"
             f"Ya /help bhejo full menu ke liye.\n\n"
-            f"Channel: {CHANNEL}" + DISCLAIMER,
+            f"Channel: {CHANNEL}\n"
+            f"WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER,
             parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 # ---------------------------------------------------------------------------
@@ -1455,6 +1586,16 @@ def build_scheduler() -> AsyncIOScheduler:
     )
     log.info("Scheduled daily cricket fetch at 07:00 IST")
 
+    # 4) Proofs channel slots — 11:00 / 17:00 / 22:00 IST daily
+    for hh, mm in PROOFS_SLOTS:
+        job_id = f"proof::{hh:02d}{mm:02d}"
+        sched.add_job(
+            post_proof_job, CronTrigger(hour=hh, minute=mm, timezone=TZ),
+            args=[(hh, mm)], id=job_id,
+            replace_existing=True, misfire_grace_time=600
+        )
+        log.info("Scheduled daily proof slot %02d:%02d IST", hh, mm)
+
     return sched
 
 # ---------------------------------------------------------------------------
@@ -1476,17 +1617,26 @@ async def post_init(application):
                           key=lambda j: j.next_run_time or datetime.max.replace(tzinfo=TZ))
             now_str = datetime.now(TZ).strftime("%H:%M IST")
             
-            lines = [f"🚀 *GurudevBook Bot v2.1 Rebooted*"]
+            # Today's cricket variant + proofs queue
+            _, variant_file, variant_name = cricket_variant_for_today()
+            queue = load_proofs_queue()
+            with db() as c:
+                proofs_sent = c.execute("SELECT COUNT(*) FROM sent_proofs").fetchone()[0]
+            proofs_remaining = max(0, len(queue) - proofs_sent)
+
+            lines = [f"🚀 *GurudevBook Bot v2.2 Rebooted*"]
             lines.append(f"Time: {now_str}")
             lines.append(f"Active jobs in queue: {len(jobs)}")
-            
+            lines.append(f"Cricket variant locked for today: *{variant_name}* (`{variant_file}`)")
+            lines.append(f"Proofs queue: {proofs_remaining} remaining of {len(queue)}")
+
             if jobs:
                 lines.append("\n*Next 3 upcoming:*")
                 for j in jobs[:3]:
                     nrt = j.next_run_time
                     if nrt:
                         lines.append(f" \u231b {nrt.astimezone(TZ).strftime('%H:%M')} \u2014 {j.id}")
-            
+
             # Note: misfire_grace_time handles recovery automatically
             lines.append("\n_Persistent JobStore active. Missed jobs (within 10m) will fire automatically._")
             
