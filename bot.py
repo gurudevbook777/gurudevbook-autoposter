@@ -1113,7 +1113,8 @@ AUTO_REPLIES = {
         f"\u2022 *Telegram:* DM is bot ko, agent jaldi reply karega\n"
         f"\u2022 *Email:* support@gurudevbook.com\n"
         f"\u2022 *FAQ:* https://gurudevbook.com/faq\n\n"
-        f"Account ya withdrawal issue ke liye apna username + screenshot bhejo." + DISCLAIMER
+        f"Account ya withdrawal issue ke liye apna username + screenshot bhejo.\n"
+        f"Register nahi kiya? Abhi karo: {REGISTER_URL}" + DISCLAIMER
     ),
     # ---- PROOFS ----
     "proof": (
