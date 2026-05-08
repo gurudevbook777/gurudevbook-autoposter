@@ -1374,9 +1374,23 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # SCHEDULER WIRING
 # ---------------------------------------------------------------------------
 def build_scheduler(application) -> AsyncIOScheduler:
-    jobstores = {
-        'default': SQLAlchemyJobStore(url=f'sqlite:///{JOBS_DB_PATH}')
-    }
+    # Ensure data directory exists before creating the SQLite jobstore.
+    # On Railway without a Volume attached, DATA_DIR may not exist — we create it.
+    # If creation fails (read-only FS), fall back to MemoryJobStore gracefully.
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        jobstore = SQLAlchemyJobStore(url=f'sqlite:///{JOBS_DB_PATH}')
+        # Test the connection immediately so we fail fast rather than at sched.start()
+        jobstore.start(None, 'default')  # triggers table creation / connection
+        jobstore.shutdown()              # close test connection; scheduler will reopen
+        jobstores = {'default': SQLAlchemyJobStore(url=f'sqlite:///{JOBS_DB_PATH}')}
+        log.info("Using SQLite persistent jobstore at %s", JOBS_DB_PATH)
+    except Exception as e:
+        log.warning("SQLite jobstore unavailable (%s) — falling back to MemoryJobStore. "
+                    "Attach a Railway Volume at %s to enable persistence.", e, DATA_DIR)
+        from apscheduler.jobstores.memory import MemoryJobStore
+        jobstores = {'default': MemoryJobStore()}
+
     executors = {
         'default': AsyncIOExecutor()
     }
