@@ -1068,48 +1068,191 @@ async def cmd_forcematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # AUTO-REPLIES (DM)
 # ---------------------------------------------------------------------------
+DISCLAIMER = "\n\n_18+ only | Responsible Gaming | Skill-based content_"
+
 AUTO_REPLIES = {
-    "tips": (f"Aaj ke VIP tips hamare official channel pe post ho chuke hain. "
-             f"Check karo: {CHANNEL}"),
-    "match": (f"Aaj ke VIP tips hamare official channel pe post ho chuke hain. "
-              f"Check karo: {CHANNEL}"),
-    "casino": (f"Live casino tables open hain! Aviator, Roulette aur bahut kuch. "
-               f"Apni ID login karo aur khelo: {REGISTER_URL}"),
-    "games": (f"Live casino tables open hain! Aviator, Roulette aur bahut kuch. "
-              f"Apni ID login karo aur khelo: {REGISTER_URL}"),
-    "bonus": (f"100% Welcome Bonus claim karne ke liye abhi register karein: "
-              f"{REGISTER_URL}\nRegistration ke baad apna username yahan bhejein."),
-    "register": (f"100% Welcome Bonus claim karne ke liye abhi register karein: "
-                 f"{REGISTER_URL}\nRegistration ke baad apna username yahan bhejein."),
-    "id": (f"100% Welcome Bonus claim karne ke liye abhi register karein: "
-           f"{REGISTER_URL}"),
-    "vip": (f"VIP club me judne ke liye pehla deposit complete karein: "
-            f"{REGISTER_URL}\nUske baad aapko premium tips milna shuru ho jayenge."),
-    "support": ("Hamari team 24x7 available hai. Kripya apna sawal yahan type "
-                "karein, ek agent jaldi hi aapse connect karega."),
-    "help": ("Hamari team 24x7 available hai. Kripya apna sawal yahan type "
-             "karein, ek agent jaldi hi aapse connect karega."),
-    "ipl": (f"IPL ke aaj ke tips hamare channel par hain: {CHANNEL}\n"
-            f"VIP combo pick ke liye register karein: {REGISTER_URL}"),
-    "cricket": (f"Cricket tips ke liye hamara channel join karein: {CHANNEL}\n"
-                f"VIP analysis: {REGISTER_URL}"),
+    # ---- TIPS ----
+    "tips": (
+        f"*VIP TIPS FUNNEL*\n\n"
+        f"Bhaiyo, hamara schedule simple hai:\n"
+        f"\u2022 *Free morning tip:* Daily 10:00 AM IST par {CHANNEL}\n"
+        f"\u2022 *VIP combo pick:* Match se 30 min pehle (members only)\n"
+        f"\u2022 *Live alerts + recap:* Match ke time par\n\n"
+        f"Paid VIP join karne ke liye register karo aur pehla deposit kar lo:\n{REGISTER_URL}" + DISCLAIMER
+    ),
+    # ---- CASINO ----
+    "casino": (
+        f"*CASINO WELCOME*\n\n"
+        f"Live tables 24x7 open hain. Top games:\n"
+        f"\u2022 *Aviator* (crash game, fast cashouts)\n"
+        f"\u2022 *Dragon Tiger* (1 round = 30 sec)\n"
+        f"\u2022 *Roulette* (European + Lightning)\n\n"
+        f"Naye members ko 100% welcome bonus milta hai. Register karo:\n{REGISTER_URL}" + DISCLAIMER
+    ),
+    # ---- BONUS ----
+    "bonus": (
+        f"*BONUS OFFERS*\n\n"
+        f"\u2022 *Welcome Bonus:* 100% up to \u20B910,000 on first deposit\n"
+        f"\u2022 *Reload Bonus:* 25% on every deposit \u20B91000+\n"
+        f"\u2022 *Refer & Earn:* \u20B9500 per active referral\n\n"
+        f"Claim karo:\n{REGISTER_URL}" + DISCLAIMER
+    ),
+    # ---- VIP ----
+    "vip": (
+        f"*VIP MEMBERSHIP*\n\n"
+        f"VIP members ko milta hai:\n"
+        f"\u2022 Pre-match VIP combo (locked picks)\n"
+        f"\u2022 Casino exclusive bonuses\n"
+        f"\u2022 Priority support + faster withdrawal\n"
+        f"\u2022 Private VIP group access\n\n"
+        f"Upgrade simple hai \u2014 register karo aur pehla deposit complete karo:\n{REGISTER_URL}" + DISCLAIMER
+    ),
+    # ---- SUPPORT ----
+    "support": (
+        f"*SUPPORT 24x7*\n\n"
+        f"\u2022 *Telegram:* DM is bot ko, agent jaldi reply karega\n"
+        f"\u2022 *Email:* support@gurudevbook.com\n"
+        f"\u2022 *FAQ:* https://gurudevbook.com/faq\n\n"
+        f"Account ya withdrawal issue ke liye apna username + screenshot bhejo." + DISCLAIMER
+    ),
+    # ---- PROOFS ----
+    "proof": (
+        f"*WINNER PROOFS*\n\n"
+        f"Daily withdrawal screenshots aur client chats hamare proofs channel par live hain:\n"
+        f"{PROOFS_CHANNEL}\n\n"
+        f"Apni jeet bhi join karo:\n{REGISTER_URL}" + DISCLAIMER
+    ),
+    # ---- REGISTER ----
+    "register": (
+        f"*REGISTER IN 3 STEPS*\n\n"
+        f"1\ufe0f\u20E3 Open: {REGISTER_URL}\n"
+        f"2\ufe0f\u20E3 Apna mobile number + email enter karo\n"
+        f"3\ufe0f\u20E3 First deposit karo aur 100% bonus claim karo\n\n"
+        f"Confirmation ke baad apna username yahan bhej do for VIP access." + DISCLAIMER
+    ),
+    # ---- WITHDRAW ----
+    "withdraw": (
+        f"*INSTANT WITHDRAWALS*\n\n"
+        f"\u2022 *Time:* 7\u201310 minutes\n"
+        f"\u2022 *Methods:* UPI / IMPS / NEFT\n"
+        f"\u2022 *Min:* \u20B9100  |  *Max:* \u20B92,00,000 per day\n\n"
+        f"KYC complete hai toh withdrawal approve auto-trigger ho jata hai.\n{REGISTER_URL}" + DISCLAIMER
+    ),
+    # ---- DEPOSIT ----
+    "deposit": (
+        f"*DEPOSITS \u2014 INSTANT*\n\n"
+        f"\u2022 *Min:* \u20B9100\n"
+        f"\u2022 *Methods:* UPI / Net Banking / Crypto\n"
+        f"\u2022 *Bonus:* 100% match on first deposit\n\n"
+        f"Deposit page:\n{REGISTER_URL}" + DISCLAIMER
+    ),
 }
+
+# Slash-command equivalents map to the same keyword replies
+SLASH_TO_KEYWORD = {
+    "tips": "tips", "casino": "casino", "bonus": "bonus", "vip": "vip",
+    "support": "support", "proofs": "proof", "proof": "proof",
+    "register": "register", "withdraw": "withdraw", "withdrawal": "withdraw",
+    "deposit": "deposit",
+}
+
+USER_HELP_TEXT = (
+    "*GurudevBook \u2014 Quick Commands*\n\n"
+    "/tips \u2014 free + VIP tips schedule\n"
+    "/casino \u2014 live casino games\n"
+    "/bonus \u2014 current bonus offers\n"
+    "/vip \u2014 VIP membership benefits\n"
+    "/register \u2014 how to sign up\n"
+    "/deposit \u2014 deposit info\n"
+    "/withdraw \u2014 withdrawal info\n"
+    "/proofs \u2014 winner proofs channel\n"
+    "/support \u2014 contact support\n\n"
+    f"Channel: {CHANNEL}  |  Proofs: {PROOFS_CHANNEL}"
+)
+
+# In-memory rate limiter: {(user_id, keyword): last_sent_unix_ts}
+_RL_BUCKET: dict = {}
+_RL_WINDOW = 300  # 5 minutes
+
+def _rate_limited(user_id: int, keyword: str) -> bool:
+    """Return True if we should NOT send (still inside cooldown)."""
+    import time
+    now = int(time.time())
+    key = (user_id, keyword)
+    last = _RL_BUCKET.get(key, 0)
+    if now - last < _RL_WINDOW:
+        return True
+    _RL_BUCKET[key] = now
+    # opportunistic cleanup
+    if len(_RL_BUCKET) > 5000:
+        cutoff = now - _RL_WINDOW
+        for k in list(_RL_BUCKET.keys()):
+            if _RL_BUCKET[k] < cutoff:
+                _RL_BUCKET.pop(k, None)
+    return False
+
+async def _send_keyword_reply(update: Update, keyword: str):
+    user_id = update.effective_user.id if update.effective_user else 0
+    if _rate_limited(user_id, keyword):
+        return
+    reply = AUTO_REPLIES.get(keyword)
+    if not reply:
+        return
+    try:
+        await update.message.reply_text(
+            reply, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    except Exception as e:
+        log.warning("Auto-reply send failed: %s", e)
+
+# Slash command handler factory
+def make_keyword_cmd(keyword: str):
+    async def _h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user and update.effective_user.is_bot:
+            return
+        await _send_keyword_reply(update, keyword)
+    return _h
+
+async def cmd_user_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.is_bot:
+        return
+    # Admins still get full admin help via the existing /help below; this is for everyone
+    await update.message.reply_text(USER_HELP_TEXT, parse_mode=ParseMode.MARKDOWN,
+                                    disable_web_page_preview=True)
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    if update.effective_chat.type != "private":
+    user = update.effective_user
+    if user and user.is_bot:
         return
+    chat_type = update.effective_chat.type
+    # Respond in DM, channel comments (linked discussion), and our own discussion group.
+    # Skip noisy public groups by only replying when bot is mentioned OR in private/discussion.
     text = update.message.text.lower().strip()
-    for keyword, reply in AUTO_REPLIES.items():
-        if keyword in text:
-            await update.message.reply_text(reply, disable_web_page_preview=True)
+    is_private = (chat_type == "private")
+    bot_username = (ctx.bot.username or "").lower()
+    is_mentioned = bot_username and ("@" + bot_username) in text
+    if not (is_private or is_mentioned or chat_type in {"group", "supergroup"}):
+        return
+    # In groups, only respond if mentioned OR a recognised keyword is the *only* word
+    matched_keyword = None
+    for kw in AUTO_REPLIES.keys():
+        if kw in text:
+            matched_keyword = kw
+            break
+    if matched_keyword:
+        # In groups without mention, only fire on short messages (<=4 words) to avoid spam
+        if chat_type != "private" and not is_mentioned and len(text.split()) > 4:
             return
-    if text in {"hi", "hello", "hey", "namaste"}:
+        await _send_keyword_reply(update, matched_keyword)
+        return
+    if is_private and text in {"hi", "hello", "hey", "namaste", "start"}:
         await update.message.reply_text(
-            "Welcome to GurudevBook!\n"
-            "Type 'tips', 'casino', 'bonus', 'ipl' or 'support' for instant info.\n"
-            "Channel: " + CHANNEL)
+            f"Namaste! GurudevBook me aapka swagat hai.\n\n"
+            f"Type karo: tips, casino, bonus, vip, register, withdraw, support\n"
+            f"Ya /help bhejo full menu ke liye.\n\n"
+            f"Channel: {CHANNEL}" + DISCLAIMER,
+            parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 # ---------------------------------------------------------------------------
 # SCHEDULER WIRING
@@ -1189,7 +1332,13 @@ def main():
     # General commands
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("claim", cmd_claim))
-    application.add_handler(CommandHandler("help", cmd_help))
+    # Admin-only deep help
+    application.add_handler(CommandHandler("adminhelp", cmd_help))
+    # Public /help for everyone
+    application.add_handler(CommandHandler("help", cmd_user_help))
+    # Public keyword slash commands
+    for slash, kw in SLASH_TO_KEYWORD.items():
+        application.add_handler(CommandHandler(slash, make_keyword_cmd(kw)))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("list", cmd_list))
     application.add_handler(CommandHandler("skip", cmd_skip))
