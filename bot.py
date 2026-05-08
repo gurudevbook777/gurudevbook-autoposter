@@ -1604,6 +1604,26 @@ def build_scheduler() -> AsyncIOScheduler:
 async def post_init(application):
     global _APP
     _APP = application   # store globally so job functions can access it without pickling
+
+    # ------------------------------------------------------------------
+    # Clear any lingering webhook so getUpdates polling can't 409-conflict
+    # with a stuck/old deployment. drop_pending_updates=False preserves
+    # any messages users sent during the redeploy window.
+    # ------------------------------------------------------------------
+    try:
+        wh = await application.bot.get_webhook_info()
+        if wh and wh.url:
+            log.warning("Stale webhook detected (%s) \u2014 deleting before polling", wh.url)
+            await application.bot.delete_webhook(drop_pending_updates=False)
+        else:
+            # Defensive: even when no URL is set, calling delete_webhook claims
+            # the polling slot back from any other getUpdates client.
+            await application.bot.delete_webhook(drop_pending_updates=False)
+        me = await application.bot.get_me()
+        log.info("Bot identity confirmed: @%s (id=%s)", me.username, me.id)
+    except Exception as e:
+        log.error("Webhook clear / get_me failed (non-fatal): %s", e)
+
     init_db()
     sched = build_scheduler()
     sched.start()
@@ -1688,7 +1708,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
                                            on_text))
 
-    log.info("GurudevBook bot v2.0 starting. Channel=%s TZ=%s", CHANNEL, TZ_NAME)
+    log.info("GurudevBook bot v2.2.1 starting. Channel=%s TZ=%s", CHANNEL, TZ_NAME)
     # drop_pending_updates=False so messages sent during a redeploy are NOT silently discarded
     application.run_polling(drop_pending_updates=False,
                             allowed_updates=Update.ALL_TYPES)
