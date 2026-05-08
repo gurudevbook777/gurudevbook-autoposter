@@ -1,9 +1,12 @@
 """
-GurudevBook Official — Telegram Auto-Posting Bot
-=================================================
-Schedules pre-fill posts (30) over the first 3 days, then loops the
-weekly calendar (28 posts) indefinitely. Posts at 10:00, 13:00, 18:00,
-21:30 IST. Provides admin commands and keyword auto-replies.
+GurudevBook Official — Telegram Auto-Posting Bot v2.0
+=====================================================
+v2.0 adds a live cricket engine:
+  - Fetches today's IPL + international cricket fixtures from Cricbuzz
+  - Schedules pre-match preview, VIP combo pick, live alert, and recap posts
+  - Admin confirms /win or /loss before recap fires (2-hour wait, then neutral)
+  - Falls back to pre-fill / calendar pool on no-match days
+  - New admin commands: /todaymatches, /win, /loss, /skiptip, /forcematch
 
 Environment variables required:
   TELEGRAM_BOT_TOKEN  — your bot token from BotFather
@@ -19,10 +22,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+import urllib.request
+import urllib.error
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -41,33 +47,36 @@ TZ_NAME = os.environ.get("TIMEZONE", "Asia/Kolkata")
 TZ = pytz.timezone(TZ_NAME)
 REGISTER_URL = os.environ.get("REGISTER_URL", "https://gurudevbook.com/register")
 
-# Railway uses an ephemeral filesystem; we persist state in /app/data
-# (committed to the repo so it survives redeploys via Railway Volumes if added)
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "state.db"
 
-# Content directory — baked into the repo
 CONTENT_DIR = Path(os.environ.get("CONTENT_DIR", "/app/content"))
 PREFILL_DIR = CONTENT_DIR / "prefill"
 CALENDAR_DIR = CONTENT_DIR / "calendar"
 CAPTIONS_FILE = CONTENT_DIR / "captions.json"
 
-# Posts to auto-pin when first sent
 PIN_FILES = {"26_warning_fake_channels.png", "30_founder_intro.png"}
 
-# Pre-fill rollout plan: 12 / 12 / 6 across the 4 daily slots
 SLOTS = [(10, 0), (13, 0), (18, 0), (21, 30)]
 PREFILL_ROLLOUT_DAYS = 3
-PREFILL_PER_DAY = [12, 12, 6]   # must sum to 30
+PREFILL_PER_DAY = [12, 12, 6]
 
-# Daily calendar slot mapping based on filename suffix
 SLOT_TIME_MAP = {
     "1000": (10, 0),
     "1300": (13, 0),
     "1800": (18, 0),
     "2130": (21, 30),
 }
+
+# Cricket: only post for these series keywords (IPL, international, major T20 leagues)
+CRICKET_SERIES_KEYWORDS = [
+    "ipl", "indian premier league",
+    "test", "odi", "t20i", "t20 international",
+    "world cup", "champions trophy", "asia cup",
+    "bbl", "psl", "sa20", "cpl", "the hundred",
+    "icc", "bilateral",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,6 +112,25 @@ def init_db():
             caption TEXT NOT NULL,
             pin     INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS cricket_matches (
+            match_id    TEXT PRIMARY KEY,
+            series      TEXT,
+            team1       TEXT,
+            team2       TEXT,
+            venue       TEXT,
+            start_ts    INTEGER,
+            status      TEXT DEFAULT 'scheduled',
+            tip_result  TEXT,
+            tip_text    TEXT,
+            skipped     INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS cricket_posts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_id    TEXT,
+            post_type   TEXT,
+            sent_at     TEXT,
+            message_id  INTEGER
+        );
         """)
 
 def setting_get(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -132,10 +160,479 @@ def already_sent(file: str, cycle: int = 0) -> bool:
     return row is not None
 
 # ---------------------------------------------------------------------------
-# CONTENT LOADER
+# CRICKET ENGINE — FIXTURE FETCHING
+# ---------------------------------------------------------------------------
+CRICBUZZ_URL = "https://www.cricbuzz.com/api/cricket-match/live-matches"
+
+def _fetch_cricbuzz_raw() -> str:
+    req = urllib.request.Request(
+        CRICBUZZ_URL,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+def _is_relevant_series(series_name: str) -> bool:
+    sl = series_name.lower()
+    return any(kw in sl for kw in CRICKET_SERIES_KEYWORDS)
+
+def fetch_today_cricket_matches() -> list[dict]:
+    """
+    Returns a list of match dicts for today (IST) that are relevant
+    (IPL, international, major T20 leagues).
+    Each dict: {match_id, series, team1, team2, venue, start_ts, state}
+    """
+    today_ist = datetime.now(TZ).date()
+    try:
+        raw = _fetch_cricbuzz_raw()
+    except Exception as e:
+        log.error("Cricbuzz fetch failed: %s", e)
+        return []
+
+    matches = []
+    # Extract match info from the HTML/JSON hybrid response
+    # Pattern: href="/live-cricket-scores/<id>/<slug>" title="<desc>"
+    match_links = re.findall(
+        r'href="(/live-cricket-scores/(\d+)/([^"]+))"[^>]*title="([^"]*)"',
+        raw
+    )
+
+    # Also extract series context by looking for series name before each match block
+    # We'll use a simpler approach: find startDate timestamps near match IDs
+    # Extract all startDate values with their surrounding context
+    start_date_pattern = re.compile(r'"startDate":"(\d+)"')
+    all_timestamps = [(int(m.group(1)), m.start()) for m in start_date_pattern.finditer(raw)]
+
+    for href, match_id, slug, title in match_links:
+        if not title.strip():
+            continue
+
+        # Parse teams from slug: e.g. "dc-vs-kkr-51st-match-ipl-2026"
+        slug_parts = slug.split("-")
+        vs_idx = None
+        for i, p in enumerate(slug_parts):
+            if p == "vs":
+                vs_idx = i
+                break
+
+        if vs_idx and vs_idx >= 1:
+            team1 = " ".join(slug_parts[:vs_idx]).upper()
+            # team2 ends before the match number
+            team2_parts = []
+            for p in slug_parts[vs_idx+1:]:
+                if re.match(r'^\d+', p) or p in ("match", "test", "odi", "t20i",
+                                                   "ipl", "bbl", "psl"):
+                    break
+                team2_parts.append(p)
+            team2 = " ".join(team2_parts).upper()
+        else:
+            team1 = "Team 1"
+            team2 = "Team 2"
+
+        # Determine series from slug tail
+        series = slug.replace("-", " ").title()
+        if not _is_relevant_series(series):
+            continue
+
+        # Find the closest startDate timestamp to this match_id in the raw text
+        match_id_pos = raw.find(f'/{match_id}/')
+        start_ts = None
+        if match_id_pos > 0:
+            # Find nearest startDate within 3000 chars before
+            nearby = raw[max(0, match_id_pos-3000):match_id_pos+200]
+            ts_matches = re.findall(r'"startDate":"(\d+)"', nearby)
+            if ts_matches:
+                start_ts = int(ts_matches[-1])
+
+        if not start_ts:
+            # Skip if we can't determine time
+            continue
+
+        # Convert to IST
+        start_dt_utc = datetime.fromtimestamp(start_ts / 1000, tz=pytz.utc)
+        start_dt_ist = start_dt_utc.astimezone(TZ)
+
+        # Only include today's matches
+        if start_dt_ist.date() != today_ist:
+            continue
+
+        # Determine state from title
+        title_lower = title.lower()
+        if "complete" in title_lower or "won" in title_lower:
+            state = "complete"
+        elif "live" in title_lower or "toss" in title_lower or "innings" in title_lower:
+            state = "live"
+        elif "preview" in title_lower or "upcoming" in title_lower:
+            state = "upcoming"
+        else:
+            state = "scheduled"
+
+        # Extract venue from title if possible
+        venue = "TBD"
+        # Title format: "Team1 vs Team2, Match Desc - Status"
+        # Venue is usually in a separate field; we'll use city from slug context
+        city_match = re.search(r'"city":"([^"]+)"', raw[max(0,match_id_pos-500):match_id_pos+500])
+        if city_match:
+            venue = city_match.group(1)
+
+        matches.append({
+            "match_id": match_id,
+            "series": series,
+            "team1": team1,
+            "team2": team2,
+            "venue": venue,
+            "start_ts": start_ts,
+            "start_dt_ist": start_dt_ist,
+            "state": state,
+            "title": title.strip(),
+        })
+
+    # Deduplicate by match_id
+    seen = set()
+    unique = []
+    for m in matches:
+        if m["match_id"] not in seen:
+            seen.add(m["match_id"])
+            unique.append(m)
+
+    log.info("Fetched %d relevant cricket matches for today", len(unique))
+    return unique
+
+def save_match_to_db(match: dict):
+    with db() as c:
+        c.execute("""
+            INSERT OR IGNORE INTO cricket_matches
+            (match_id, series, team1, team2, venue, start_ts, status)
+            VALUES (?,?,?,?,?,?,?)
+        """, (match["match_id"], match["series"], match["team1"],
+              match["team2"], match["venue"], match["start_ts"], "scheduled"))
+
+def get_match_from_db(match_id: str) -> Optional[dict]:
+    with db() as c:
+        row = c.execute(
+            "SELECT match_id,series,team1,team2,venue,start_ts,status,tip_result,tip_text,skipped "
+            "FROM cricket_matches WHERE match_id=?", (match_id,)
+        ).fetchone()
+    if not row:
+        return None
+    keys = ["match_id","series","team1","team2","venue","start_ts",
+            "status","tip_result","tip_text","skipped"]
+    return dict(zip(keys, row))
+
+def get_latest_match_id() -> Optional[str]:
+    """Return the most recently scheduled match_id."""
+    with db() as c:
+        row = c.execute(
+            "SELECT match_id FROM cricket_matches "
+            "ORDER BY start_ts DESC LIMIT 1"
+        ).fetchone()
+    return row[0] if row else None
+
+def cricket_post_already_sent(match_id: str, post_type: str) -> bool:
+    with db() as c:
+        row = c.execute(
+            "SELECT 1 FROM cricket_posts WHERE match_id=? AND post_type=?",
+            (match_id, post_type)
+        ).fetchone()
+    return row is not None
+
+def mark_cricket_post_sent(match_id: str, post_type: str, message_id: int):
+    with db() as c:
+        c.execute(
+            "INSERT INTO cricket_posts(match_id,post_type,sent_at,message_id) "
+            "VALUES (?,?,?,?)",
+            (match_id, post_type, datetime.now(TZ).isoformat(), message_id)
+        )
+
+# ---------------------------------------------------------------------------
+# CRICKET CAPTION GENERATOR
+# ---------------------------------------------------------------------------
+def _team_display(team_code: str) -> str:
+    """Convert slug-style team code to a display name."""
+    mapping = {
+        "DC": "Delhi Capitals", "KKR": "Kolkata Knight Riders",
+        "CSK": "Chennai Super Kings", "MI": "Mumbai Indians",
+        "RCB": "Royal Challengers Bengaluru", "SRH": "Sunrisers Hyderabad",
+        "PBKS": "Punjab Kings", "RR": "Rajasthan Royals",
+        "GT": "Gujarat Titans", "LSG": "Lucknow Super Giants",
+        "IND": "India", "PAK": "Pakistan", "AUS": "Australia",
+        "ENG": "England", "SA": "South Africa", "NZ": "New Zealand",
+        "WI": "West Indies", "SL": "Sri Lanka", "BAN": "Bangladesh",
+        "AFG": "Afghanistan", "ZIM": "Zimbabwe",
+    }
+    return mapping.get(team_code.upper(), team_code.title())
+
+def _simple_tip_pick(team1: str, team2: str) -> tuple[str, str]:
+    """
+    Very simple heuristic tip: home team advantage or alphabetical.
+    Returns (pick_team, reasoning).
+    """
+    home_teams = {
+        "DC": "Delhi", "KKR": "Kolkata", "CSK": "Chennai",
+        "MI": "Mumbai", "RCB": "Bengaluru", "SRH": "Hyderabad",
+        "PBKS": "Mohali", "RR": "Jaipur", "GT": "Ahmedabad",
+        "LSG": "Lucknow",
+    }
+    t1 = team1.split()[0].upper()
+    t2 = team2.split()[0].upper()
+    if t1 in home_teams:
+        return team1, "home ground advantage + recent form"
+    if t2 in home_teams:
+        return team2, "home ground advantage + recent form"
+    # Fallback: pick team1
+    return team1, "current form aur head-to-head record"
+
+def make_preview_caption(match: dict) -> str:
+    t1 = _team_display(match["team1"].split()[0])
+    t2 = _team_display(match["team2"].split()[0])
+    start_dt = datetime.fromtimestamp(match["start_ts"]/1000, tz=TZ)
+    time_str = start_dt.strftime("%I:%M %p IST")
+    venue = match.get("venue", "TBD")
+    series = match.get("series", "Cricket")
+
+    return (
+        f"MATCH PREVIEW — {t1} vs {t2}\n\n"
+        f"Series: {series}\n"
+        f"Time: {time_str}\n"
+        f"Venue: {venue}\n\n"
+        f"Bhaiyo, aaj ka match ek important encounter hai. "
+        f"Hamari research team dono teams ki form, pitch conditions aur "
+        f"head-to-head stats analyze kar rahi hai.\n\n"
+        f"VIP combo pick aaj match se 30 min pehle is channel par drop hoga. "
+        f"Channel UNMUTE rakho!\n\n"
+        f"Abhi register karo — 100% welcome bonus + 1 free VIP tip:\n"
+        f"{REGISTER_URL}\n\n"
+        f"#GurudevBook #{t1.replace(' ','')} #{t2.replace(' ','')} "
+        f"#VIPTipper #CricketTips"
+    )
+
+def make_combo_caption(match: dict) -> str:
+    t1 = _team_display(match["team1"].split()[0])
+    t2 = _team_display(match["team2"].split()[0])
+    pick, reason = _simple_tip_pick(match["team1"], match["team2"])
+    pick_display = _team_display(pick.split()[0])
+
+    # Save the tip text to DB for recap
+    tip_text = f"{pick_display} Win"
+    with db() as c:
+        c.execute("UPDATE cricket_matches SET tip_text=? WHERE match_id=?",
+                  (tip_text, match["match_id"]))
+
+    return (
+        f"VIP COMBO LOCKED — {t1} vs {t2}\n\n"
+        f"Hamari pick: {pick_display} Win\n"
+        f"Reason: {reason}\n\n"
+        f"Disclaimer: Ye analysis sirf entertainment aur information ke liye hai. "
+        f"Responsible gaming karein. 18+ only.\n\n"
+        f"Full VIP analysis + odds breakdown ke liye register karein:\n"
+        f"{REGISTER_URL}\n\n"
+        f"#VIPCombo #GurudevBook #{t1.replace(' ','')}vs{t2.replace(' ','')} "
+        f"#CricketTips #WinWithGurudev"
+    )
+
+def make_live_alert_caption(match: dict) -> str:
+    t1 = _team_display(match["team1"].split()[0])
+    t2 = _team_display(match["team2"].split()[0])
+    return (
+        f"MATCH LIVE — {t1} vs {t2}\n\n"
+        f"Match shuru ho gaya! Apni ID login karo aur enjoy karo.\n\n"
+        f"Live updates aur score ke liye channel follow karte raho.\n"
+        f"Abhi tak register nahi kiya? Jaldi karo:\n"
+        f"{REGISTER_URL}\n\n"
+        f"#LiveNow #GurudevBook #{t1.replace(' ','')}vs{t2.replace(' ','')} "
+        f"#CricketLive"
+    )
+
+def make_recap_caption(match: dict, result: Optional[str] = None) -> str:
+    t1 = _team_display(match["team1"].split()[0])
+    t2 = _team_display(match["team2"].split()[0])
+    tip_text = match.get("tip_text") or f"{t1} Win"
+
+    if result == "win":
+        return (
+            f"TIP HIT — {t1} vs {t2}\n\n"
+            f"Hamara pick '{tip_text}' — CORRECT!\n\n"
+            f"Bhaiyo, aaj ke VIP members ne mast return banaya. "
+            f"Kal ka combo bhi is channel par aayega.\n\n"
+            f"Abhi tak join nahi kiya? Kal miss mat karo:\n"
+            f"{REGISTER_URL}\n\n"
+            f"#TipHit #GurudevBook #WinWithGurudev "
+            f"#{t1.replace(' ','')}vs{t2.replace(' ','')} #VIPLife"
+        )
+    elif result == "loss":
+        return (
+            f"MATCH RESULT — {t1} vs {t2}\n\n"
+            f"Aaj ka pick '{tip_text}' — result expected ke against gaya.\n\n"
+            f"Cricket mein upsets hote hain — yahi game hai. "
+            f"Hamari team kal fresh analysis ke saath wapas aayegi. "
+            f"Long-term mein consistency hi winner banati hai.\n\n"
+            f"Responsible gaming karein. 18+ only.\n"
+            f"Register: {REGISTER_URL}\n\n"
+            f"#GurudevBook #HonestTipper "
+            f"#{t1.replace(' ','')}vs{t2.replace(' ','')} #CricketAnalysis"
+        )
+    else:
+        # Neutral recap (no admin response)
+        return (
+            f"MATCH OVER — {t1} vs {t2}\n\n"
+            f"Match khatam ho gaya. Full result aur analysis kal subah "
+            f"channel par share kiya jayega.\n\n"
+            f"Daily VIP tips ke liye channel subscribe karein:\n"
+            f"{REGISTER_URL}\n\n"
+            f"#GurudevBook #{t1.replace(' ','')}vs{t2.replace(' ','')} "
+            f"#CricketResults"
+        )
+
+# ---------------------------------------------------------------------------
+# CRICKET SCHEDULER
+# ---------------------------------------------------------------------------
+async def post_text_to_channel(application, text: str, match_id: str, post_type: str):
+    """Send a text-only post to the channel and record it."""
+    if cricket_post_already_sent(match_id, post_type):
+        log.info("Cricket post %s/%s already sent", match_id, post_type)
+        return
+    try:
+        msg = await application.bot.send_message(
+            chat_id=CHANNEL, text=text, disable_web_page_preview=True
+        )
+        mark_cricket_post_sent(match_id, post_type, msg.message_id)
+        log.info("[CRICKET %s] match=%s msg_id=%s", post_type, match_id, msg.message_id)
+    except Exception as e:
+        log.error("Cricket post failed (%s/%s): %s", match_id, post_type, e)
+
+async def cricket_preview_job(application, match_id: str):
+    match = get_match_from_db(match_id)
+    if not match or match["skipped"]:
+        return
+    if setting_get("cricket_paused") == "1":
+        return
+    caption = make_preview_caption(match)
+    await post_text_to_channel(application, caption, match_id, "preview")
+
+async def cricket_combo_job(application, match_id: str):
+    match = get_match_from_db(match_id)
+    if not match or match["skipped"]:
+        return
+    if setting_get("cricket_paused") == "1":
+        return
+    caption = make_combo_caption(match)
+    await post_text_to_channel(application, caption, match_id, "combo")
+
+async def cricket_live_alert_job(application, match_id: str):
+    match = get_match_from_db(match_id)
+    if not match or match["skipped"]:
+        return
+    if setting_get("cricket_paused") == "1":
+        return
+    caption = make_live_alert_caption(match)
+    await post_text_to_channel(application, caption, match_id, "live_alert")
+
+async def cricket_recap_job(application, match_id: str):
+    """
+    Fires ~2 hours after match start. Checks if admin sent /win or /loss.
+    If not, posts neutral recap.
+    """
+    match = get_match_from_db(match_id)
+    if not match or match["skipped"]:
+        return
+    if cricket_post_already_sent(match_id, "recap"):
+        return
+    if setting_get("cricket_paused") == "1":
+        return
+    result = match.get("tip_result")  # "win", "loss", or None
+    caption = make_recap_caption(match, result)
+    await post_text_to_channel(application, caption, match_id, "recap")
+
+def schedule_cricket_match(application, sched: AsyncIOScheduler, match: dict):
+    """Add 4 jobs for a single match: preview, combo, live alert, recap."""
+    match_id = match["match_id"]
+    start_dt = match["start_dt_ist"]
+    now = datetime.now(TZ)
+
+    jobs_added = 0
+
+    # Preview: 3 hours before
+    preview_dt = start_dt - timedelta(hours=3)
+    if preview_dt > now + timedelta(seconds=30):
+        sched.add_job(
+            cricket_preview_job, "date", run_date=preview_dt,
+            args=[application, match_id],
+            id=f"cricket_preview::{match_id}",
+            replace_existing=True, misfire_grace_time=3600
+        )
+        log.info("Scheduled cricket PREVIEW for %s at %s IST",
+                 match_id, preview_dt.strftime("%H:%M"))
+        jobs_added += 1
+
+    # Combo pick: 30 min before
+    combo_dt = start_dt - timedelta(minutes=30)
+    if combo_dt > now + timedelta(seconds=30):
+        sched.add_job(
+            cricket_combo_job, "date", run_date=combo_dt,
+            args=[application, match_id],
+            id=f"cricket_combo::{match_id}",
+            replace_existing=True, misfire_grace_time=1800
+        )
+        log.info("Scheduled cricket COMBO for %s at %s IST",
+                 match_id, combo_dt.strftime("%H:%M"))
+        jobs_added += 1
+
+    # Live alert: at match start
+    if start_dt > now + timedelta(seconds=30):
+        sched.add_job(
+            cricket_live_alert_job, "date", run_date=start_dt,
+            args=[application, match_id],
+            id=f"cricket_live::{match_id}",
+            replace_existing=True, misfire_grace_time=1800
+        )
+        log.info("Scheduled cricket LIVE ALERT for %s at %s IST",
+                 match_id, start_dt.strftime("%H:%M"))
+        jobs_added += 1
+
+    # Recap: 2.5 hours after match start (admin has 2h to send /win or /loss)
+    recap_dt = start_dt + timedelta(hours=2, minutes=30)
+    if recap_dt > now + timedelta(seconds=30):
+        sched.add_job(
+            cricket_recap_job, "date", run_date=recap_dt,
+            args=[application, match_id],
+            id=f"cricket_recap::{match_id}",
+            replace_existing=True, misfire_grace_time=3600
+        )
+        log.info("Scheduled cricket RECAP for %s at %s IST",
+                 match_id, recap_dt.strftime("%H:%M"))
+        jobs_added += 1
+
+    return jobs_added
+
+async def daily_cricket_fetch_job(application):
+    """
+    Runs at 07:00 IST every morning.
+    Fetches today's matches and schedules their posts.
+    """
+    log.info("Daily cricket fetch starting...")
+    sched: AsyncIOScheduler = application.bot_data.get("scheduler")
+    if not sched:
+        log.error("Scheduler not found in bot_data")
+        return
+
+    matches = fetch_today_cricket_matches()
+    if not matches:
+        log.info("No relevant cricket matches today — fallback posts will run")
+        return
+
+    count = 0
+    for match in matches:
+        save_match_to_db(match)
+        jobs = schedule_cricket_match(application, sched, match)
+        count += jobs
+
+    log.info("Cricket fetch done: %d matches, %d jobs scheduled", len(matches), count)
+
+# ---------------------------------------------------------------------------
+# CONTENT LOADER (unchanged from v1)
 # ---------------------------------------------------------------------------
 def load_captions():
-    """Returns ({prefill_file: caption}, {calendar_file: caption})."""
     if not CAPTIONS_FILE.exists():
         log.warning("captions.json missing — using empty captions")
         return {}, {}
@@ -145,7 +642,6 @@ def load_captions():
     return pre, cal
 
 def list_prefill_in_order():
-    """All 30 pre-fill PNGs in sorted (numeric) order."""
     files = sorted(p.name for p in PREFILL_DIR.glob("*.png"))
     return files
 
@@ -168,7 +664,7 @@ def current_cycle_day() -> int:
     return (days_in % 7) + 1
 
 # ---------------------------------------------------------------------------
-# PRE-FILL ROLLOUT
+# PRE-FILL ROLLOUT (unchanged from v1)
 # ---------------------------------------------------------------------------
 def prefill_schedule():
     files = list_prefill_in_order()
@@ -197,7 +693,6 @@ def prefill_schedule():
             if slot_pos % 4 == 0:
                 offset_minutes += 7
         day_idx += 1
-
     return schedule
 
 # ---------------------------------------------------------------------------
@@ -278,19 +773,26 @@ async def post_calendar_slot(application, slot_hh_mm):
 # ADMIN COMMANDS
 # ---------------------------------------------------------------------------
 HELP_TEXT = (
-    "*GurudevBook Bot — Admin Commands*\n\n"
+    "*GurudevBook Bot v2.0 — Admin Commands*\n\n"
+    "*Cricket Commands:*\n"
+    "/todaymatches — list today's fetched cricket matches\n"
+    "/win [match\\_id] — mark our tip as WON; triggers recap\n"
+    "/loss [match\\_id] — mark our tip as LOSS; triggers recap\n"
+    "/skiptip [match\\_id] — skip all posts for that match\n"
+    "/forcematch Team1 vs Team2 @ HH:MM — manually add a match\n"
+    "/pause — pause cricket auto-posting\n"
+    "/resume — resume cricket auto-posting\n\n"
+    "*General Commands:*\n"
     "/claim — claim admin (first user wins)\n"
-    "/status — next 5 scheduled posts\n"
-    "/list — list upcoming queue\n"
-    "/skip — skip the next scheduled post\n"
-    "/pause — pause auto-posting\n"
-    "/resume — resume auto-posting\n"
+    "/status — next 5 scheduled jobs\n"
+    "/list — list all upcoming jobs\n"
+    "/skip — skip the next scheduled job\n"
     "/help — this menu"
 )
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Welcome to GurudevBook VIP Support! \n\n"
+        "Welcome to GurudevBook VIP Support!\n\n"
         f"100% welcome bonus claim karne ke liye yahan register karein:\n"
         f"{REGISTER_URL}\n\n"
         "Type 'tips', 'casino', 'bonus' or 'support' for quick info.\n"
@@ -302,7 +804,7 @@ async def cmd_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if existing:
         if str(chat_id) == existing:
-            await update.message.reply_text("You are already admin")
+            await update.message.reply_text("You are already admin.")
         else:
             await update.message.reply_text(
                 "Admin already claimed. Contact existing admin.")
@@ -310,7 +812,7 @@ async def cmd_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     setting_set("admin_chat_id", str(chat_id))
     await update.message.reply_text(
         f"Admin claimed! Your chat ID {chat_id} is now the bot owner.\n\n"
-        "Send /help to see admin commands.")
+        "Send /help to see all admin commands.")
     log.info("Admin claimed by chat_id=%s", chat_id)
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -325,12 +827,20 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     jobs = sorted(sched.get_jobs(),
                   key=lambda j: j.next_run_time or datetime.max.replace(tzinfo=TZ))
     paused = setting_get("paused") == "1"
-    lines = ["PAUSED" if paused else "Active",
-             f"Total scheduled jobs: {len(jobs)}",
-             "Next 5:"]
+    cricket_paused = setting_get("cricket_paused") == "1"
+    lines = []
+    if paused:
+        lines.append("STATUS: PAUSED (all posts)")
+    elif cricket_paused:
+        lines.append("STATUS: Cricket posts PAUSED (fallback active)")
+    else:
+        lines.append("STATUS: Active")
+    lines.append(f"Total scheduled jobs: {len(jobs)}")
+    lines.append("Next 5:")
     for j in jobs[:5]:
         nrt = j.next_run_time
-        lines.append(f"  {nrt.astimezone(TZ).strftime('%a %d %b %H:%M')} — {j.id}")
+        if nrt:
+            lines.append(f"  {nrt.astimezone(TZ).strftime('%a %d %b %H:%M')} — {j.id}")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -345,7 +855,8 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [f"Upcoming ({len(jobs)}):"]
     for j in jobs[:20]:
         nrt = j.next_run_time
-        lines.append(f"  {nrt.astimezone(TZ).strftime('%d %b %H:%M')} — {j.id}")
+        if nrt:
+            lines.append(f"  {nrt.astimezone(TZ).strftime('%d %b %H:%M')} — {j.id}")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -365,13 +876,163 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id):
         return
     setting_set("paused", "1")
-    await update.message.reply_text("Auto-posting paused.")
+    setting_set("cricket_paused", "1")
+    await update.message.reply_text("All auto-posting paused (cricket + fallback).")
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id):
         return
     setting_set("paused", "0")
-    await update.message.reply_text("Auto-posting resumed.")
+    setting_set("cricket_paused", "0")
+    await update.message.reply_text("Auto-posting resumed (cricket + fallback).")
+
+# ---------------------------------------------------------------------------
+# NEW CRICKET ADMIN COMMANDS
+# ---------------------------------------------------------------------------
+async def cmd_todaymatches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id):
+        return
+    with db() as c:
+        today_start = int(datetime.now(TZ).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp() * 1000)
+        today_end = today_start + 86400000
+        rows = c.execute(
+            "SELECT match_id, team1, team2, series, start_ts, status, skipped "
+            "FROM cricket_matches WHERE start_ts >= ? AND start_ts < ? "
+            "ORDER BY start_ts",
+            (today_start, today_end)
+        ).fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            "Aaj ke liye koi cricket match nahi mila database mein.\n"
+            "Bot 7:00 AM IST par automatically fetch karta hai.\n"
+            "Manual fetch ke liye /forcematch use karein."
+        )
+        return
+
+    lines = [f"Aaj ke cricket matches ({len(rows)}):"]
+    for row in rows:
+        match_id, t1, t2, series, start_ts, status, skipped = row
+        start_dt = datetime.fromtimestamp(start_ts/1000, tz=TZ)
+        skip_flag = " [SKIPPED]" if skipped else ""
+        lines.append(
+            f"\n  ID: {match_id}\n"
+            f"  {_team_display(t1.split()[0])} vs {_team_display(t2.split()[0])}\n"
+            f"  {series}\n"
+            f"  Start: {start_dt.strftime('%I:%M %p IST')}\n"
+            f"  Status: {status}{skip_flag}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_win(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id):
+        return
+    args = ctx.args
+    match_id = args[0] if args else get_latest_match_id()
+    if not match_id:
+        await update.message.reply_text("Koi match nahi mila. Match ID specify karein.")
+        return
+    with db() as c:
+        c.execute("UPDATE cricket_matches SET tip_result='win', status='complete' "
+                  "WHERE match_id=?", (match_id,))
+    match = get_match_from_db(match_id)
+    if match:
+        caption = make_recap_caption(match, "win")
+        await post_text_to_channel(
+            update.get_bot() or ctx.application, caption, match_id, "recap"
+        )
+        await update.message.reply_text(
+            f"Win marked for {match_id}. Recap post sent to channel!")
+    else:
+        await update.message.reply_text(f"Match {match_id} nahi mila database mein.")
+
+async def cmd_loss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id):
+        return
+    args = ctx.args
+    match_id = args[0] if args else get_latest_match_id()
+    if not match_id:
+        await update.message.reply_text("Koi match nahi mila. Match ID specify karein.")
+        return
+    with db() as c:
+        c.execute("UPDATE cricket_matches SET tip_result='loss', status='complete' "
+                  "WHERE match_id=?", (match_id,))
+    match = get_match_from_db(match_id)
+    if match:
+        caption = make_recap_caption(match, "loss")
+        await post_text_to_channel(
+            update.get_bot() or ctx.application, caption, match_id, "recap"
+        )
+        await update.message.reply_text(
+            f"Loss marked for {match_id}. Recap post sent to channel.")
+    else:
+        await update.message.reply_text(f"Match {match_id} nahi mila database mein.")
+
+async def cmd_skiptip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id):
+        return
+    args = ctx.args
+    match_id = args[0] if args else get_latest_match_id()
+    if not match_id:
+        await update.message.reply_text("Match ID specify karein.")
+        return
+    with db() as c:
+        c.execute("UPDATE cricket_matches SET skipped=1 WHERE match_id=?",
+                  (match_id,))
+    # Also remove scheduled jobs for this match
+    sched: AsyncIOScheduler = ctx.application.bot_data.get("scheduler")
+    if sched:
+        for job_type in ("preview", "combo", "live", "recap"):
+            job_id = f"cricket_{job_type}::{match_id}"
+            try:
+                sched.remove_job(job_id)
+            except Exception:
+                pass
+    await update.message.reply_text(
+        f"Match {match_id} ke liye sab posts skip kar diye gaye.")
+
+async def cmd_forcematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage: /forcematch Team1 vs Team2 @ HH:MM
+    Example: /forcematch IND vs PAK @ 19:30
+    """
+    if not is_admin(update.effective_chat.id):
+        return
+    text = " ".join(ctx.args) if ctx.args else ""
+    # Parse: "Team1 vs Team2 @ HH:MM"
+    m = re.match(r"(.+?)\s+vs\s+(.+?)\s+@\s+(\d{1,2}):(\d{2})", text, re.IGNORECASE)
+    if not m:
+        await update.message.reply_text(
+            "Format: /forcematch Team1 vs Team2 @ HH:MM\n"
+            "Example: /forcematch IND vs PAK @ 19:30"
+        )
+        return
+    t1, t2, hh, mm = m.group(1).strip(), m.group(2).strip(), int(m.group(3)), int(m.group(4))
+    today = datetime.now(TZ).date()
+    start_dt = TZ.localize(datetime(today.year, today.month, today.day, hh, mm))
+    match_id = f"manual_{t1.lower().replace(' ','_')}_vs_{t2.lower().replace(' ','_')}"
+    match = {
+        "match_id": match_id,
+        "series": "Manual Entry",
+        "team1": t1.upper(),
+        "team2": t2.upper(),
+        "venue": "TBD",
+        "start_ts": int(start_dt.timestamp() * 1000),
+        "start_dt_ist": start_dt,
+        "state": "scheduled",
+    }
+    save_match_to_db(match)
+    sched: AsyncIOScheduler = ctx.application.bot_data.get("scheduler")
+    jobs = 0
+    if sched:
+        jobs = schedule_cricket_match(ctx.application, sched, match)
+    await update.message.reply_text(
+        f"Match added: {t1} vs {t2} at {hh:02d}:{mm:02d} IST\n"
+        f"Match ID: {match_id}\n"
+        f"Jobs scheduled: {jobs}"
+    )
 
 # ---------------------------------------------------------------------------
 # AUTO-REPLIES (DM)
@@ -397,6 +1058,10 @@ AUTO_REPLIES = {
                 "karein, ek agent jaldi hi aapse connect karega."),
     "help": ("Hamari team 24x7 available hai. Kripya apna sawal yahan type "
              "karein, ek agent jaldi hi aapse connect karega."),
+    "ipl": (f"IPL ke aaj ke tips hamare channel par hain: {CHANNEL}\n"
+            f"VIP combo pick ke liye register karein: {REGISTER_URL}"),
+    "cricket": (f"Cricket tips ke liye hamara channel join karein: {CHANNEL}\n"
+                f"VIP analysis: {REGISTER_URL}"),
 }
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -411,8 +1076,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
     if text in {"hi", "hello", "hey", "namaste"}:
         await update.message.reply_text(
-            "Welcome to GurudevBook! \nType 'tips', 'casino', 'bonus' or "
-            "'support' for instant info, or visit our channel: " + CHANNEL)
+            "Welcome to GurudevBook!\n"
+            "Type 'tips', 'casino', 'bonus', 'ipl' or 'support' for instant info.\n"
+            "Channel: " + CHANNEL)
 
 # ---------------------------------------------------------------------------
 # SCHEDULER WIRING
@@ -420,7 +1086,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def build_scheduler(application) -> AsyncIOScheduler:
     sched = AsyncIOScheduler(timezone=TZ)
 
-    # 1) Schedule pre-fill rollout (one-shot dated jobs)
+    # 1) Pre-fill rollout (one-shot dated jobs)
     plan = prefill_schedule()
     for ts, file_name in plan:
         if already_sent(file_name, cycle=0):
@@ -432,7 +1098,7 @@ def build_scheduler(application) -> AsyncIOScheduler:
         log.info("Scheduled pre-fill %s at %s", file_name,
                  ts.strftime("%a %d %b %H:%M %Z"))
 
-    # 2) Schedule the 4 daily calendar slots (recurring cron)
+    # 2) Daily calendar slots (recurring cron — fallback on no-match days)
     for hh, mm in SLOTS:
         job_id = f"cal::{hh:02d}{mm:02d}"
         sched.add_job(post_calendar_slot, CronTrigger(hour=hh, minute=mm,
@@ -440,6 +1106,14 @@ def build_scheduler(application) -> AsyncIOScheduler:
                       args=[application, (hh, mm)], id=job_id,
                       replace_existing=True, misfire_grace_time=600)
         log.info("Scheduled daily calendar slot %02d:%02d IST", hh, mm)
+
+    # 3) Daily cricket fixture fetch at 07:00 IST
+    sched.add_job(
+        daily_cricket_fetch_job, CronTrigger(hour=7, minute=0, timezone=TZ),
+        args=[application], id="cricket_daily_fetch",
+        replace_existing=True, misfire_grace_time=3600
+    )
+    log.info("Scheduled daily cricket fetch at 07:00 IST")
 
     return sched
 
@@ -452,21 +1126,27 @@ async def post_init(application):
     sched.start()
     application.bot_data["scheduler"] = sched
 
+    # Smoke test
     if os.environ.get("SMOKE_TEST_ON_BOOT") == "1" and \
        setting_get("smoke_done") != "1":
         try:
             now_str = datetime.now(TZ).strftime("%H:%M IST on %d %b %Y")
             msg = await application.bot.send_message(
                 chat_id=CHANNEL,
-                text=(f"GurudevBook auto-poster is LIVE.\n"
-                      f"First scheduled post will go out at the next slot "
-                      f"(10:00 / 13:00 / 18:00 / 21:30 IST).\n"
+                text=(f"GurudevBook auto-poster v2.0 is LIVE.\n"
+                      f"Cricket engine active — daily fetch at 07:00 IST.\n"
                       f"Boot time: {now_str}"))
             setting_set("smoke_done", "1")
             log.info("Smoke test message sent (msg_id=%s). "
-                     "You can delete it from the channel manually.", msg.message_id)
+                     "Delete it from the channel manually.", msg.message_id)
         except Exception as e:
             log.error("Smoke test failed: %s", e)
+
+    # Run cricket fetch immediately on first boot (so today's matches are loaded)
+    if setting_get("first_cricket_fetch_done") != "1":
+        log.info("Running initial cricket fetch on boot...")
+        await daily_cricket_fetch_job(application)
+        setting_set("first_cricket_fetch_done", "1")
 
 def main():
     application = (Application.builder()
@@ -474,6 +1154,7 @@ def main():
                    .post_init(post_init)
                    .build())
 
+    # General commands
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("claim", cmd_claim))
     application.add_handler(CommandHandler("help", cmd_help))
@@ -482,10 +1163,19 @@ def main():
     application.add_handler(CommandHandler("skip", cmd_skip))
     application.add_handler(CommandHandler("pause", cmd_pause))
     application.add_handler(CommandHandler("resume", cmd_resume))
+
+    # Cricket commands
+    application.add_handler(CommandHandler("todaymatches", cmd_todaymatches))
+    application.add_handler(CommandHandler("win", cmd_win))
+    application.add_handler(CommandHandler("loss", cmd_loss))
+    application.add_handler(CommandHandler("skiptip", cmd_skiptip))
+    application.add_handler(CommandHandler("forcematch", cmd_forcematch))
+
+    # DM auto-replies
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
                                            on_text))
 
-    log.info("GurudevBook bot starting. Channel=%s TZ=%s", CHANNEL, TZ_NAME)
+    log.info("GurudevBook bot v2.0 starting. Channel=%s TZ=%s", CHANNEL, TZ_NAME)
     application.run_polling(drop_pending_updates=True,
                             allowed_updates=Update.ALL_TYPES)
 
