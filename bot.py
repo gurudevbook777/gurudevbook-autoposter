@@ -42,6 +42,15 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
 # ---------------------------------------------------------------------------
+# MODULE-LEVEL APP REFERENCE
+# APScheduler's SQLAlchemy jobstore pickles job arguments. The Application
+# object cannot be pickled (Bot raises PicklingError). Solution: store the
+# application in a module-level variable and have job functions retrieve it
+# from there instead of receiving it as an argument.
+# ---------------------------------------------------------------------------
+_APP = None   # set in post_init before scheduler starts
+
+# ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -538,8 +547,9 @@ def make_recap_caption(match: dict, result: Optional[str] = None) -> str:
 # ---------------------------------------------------------------------------
 # CRICKET SCHEDULER
 # ---------------------------------------------------------------------------
-async def post_text_to_channel(application, text: str, match_id: str, post_type: str):
+async def post_text_to_channel(text: str, match_id: str, post_type: str):
     """Send a text-only post to the channel and record it."""
+    application = _APP
     if cricket_post_already_sent(match_id, post_type):
         log.info("Cricket post %s/%s already sent", match_id, post_type)
         return
@@ -552,7 +562,7 @@ async def post_text_to_channel(application, text: str, match_id: str, post_type:
     except Exception as e:
         log.error("Cricket post failed (%s/%s): %s", match_id, post_type, e)
 
-async def cricket_preview_job(application, match_id: str):
+async def cricket_preview_job(match_id: str):
     job_id = f"cricket_preview::{match_id}"
     try:
         match = get_match_from_db(match_id)
@@ -561,14 +571,14 @@ async def cricket_preview_job(application, match_id: str):
         if setting_get("cricket_paused") == "1":
             return
         caption = make_preview_caption(match)
-        await post_text_to_channel(application, caption, match_id, "preview")
+        await post_text_to_channel(caption, match_id, "preview")
         log_fired_job(job_id, "ok")
     except Exception as e:
         log.error("Cricket preview job failed for %s: %s", match_id, e)
         log_fired_job(job_id, "error")
         log_bot_error(job_id, str(e))
 
-async def cricket_combo_job(application, match_id: str):
+async def cricket_combo_job(match_id: str):
     job_id = f"cricket_combo::{match_id}"
     try:
         match = get_match_from_db(match_id)
@@ -577,14 +587,14 @@ async def cricket_combo_job(application, match_id: str):
         if setting_get("cricket_paused") == "1":
             return
         caption = make_combo_caption(match)
-        await post_text_to_channel(application, caption, match_id, "combo")
+        await post_text_to_channel(caption, match_id, "combo")
         log_fired_job(job_id, "ok")
     except Exception as e:
         log.error("Cricket combo job failed for %s: %s", match_id, e)
         log_fired_job(job_id, "error")
         log_bot_error(job_id, str(e))
 
-async def cricket_live_alert_job(application, match_id: str):
+async def cricket_live_alert_job(match_id: str):
     job_id = f"cricket_live::{match_id}"
     try:
         match = get_match_from_db(match_id)
@@ -593,14 +603,14 @@ async def cricket_live_alert_job(application, match_id: str):
         if setting_get("cricket_paused") == "1":
             return
         caption = make_live_alert_caption(match)
-        await post_text_to_channel(application, caption, match_id, "live_alert")
+        await post_text_to_channel(caption, match_id, "live_alert")
         log_fired_job(job_id, "ok")
     except Exception as e:
         log.error("Cricket live alert job failed for %s: %s", match_id, e)
         log_fired_job(job_id, "error")
         log_bot_error(job_id, str(e))
 
-async def cricket_recap_job(application, match_id: str):
+async def cricket_recap_job(match_id: str):
     """
     Fires ~2 hours after match start. Checks if admin sent /win or /loss.
     If not, posts neutral recap.
@@ -616,15 +626,17 @@ async def cricket_recap_job(application, match_id: str):
             return
         result = match.get("tip_result")  # "win", "loss", or None
         caption = make_recap_caption(match, result)
-        await post_text_to_channel(application, caption, match_id, "recap")
+        await post_text_to_channel(caption, match_id, "recap")
         log_fired_job(job_id, "ok")
     except Exception as e:
         log.error("Cricket recap job failed for %s: %s", match_id, e)
         log_fired_job(job_id, "error")
         log_bot_error(job_id, str(e))
 
-def schedule_cricket_match(application, sched: AsyncIOScheduler, match: dict):
-    """Add 4 jobs for a single match: preview, combo, live alert, recap."""
+def schedule_cricket_match(sched: AsyncIOScheduler, match: dict):
+    """Add 4 jobs for a single match: preview, combo, live alert, recap.
+    Uses module-level _APP so job args are picklable for SQLAlchemy jobstore.
+    """
     match_id = match["match_id"]
     start_dt = match["start_dt_ist"]
     now = datetime.now(TZ)
@@ -636,7 +648,7 @@ def schedule_cricket_match(application, sched: AsyncIOScheduler, match: dict):
     if preview_dt > now + timedelta(seconds=30):
         sched.add_job(
             cricket_preview_job, "date", run_date=preview_dt,
-            args=[application, match_id],
+            args=[match_id],
             id=f"cricket_preview::{match_id}",
             replace_existing=True, misfire_grace_time=3600
         )
@@ -649,7 +661,7 @@ def schedule_cricket_match(application, sched: AsyncIOScheduler, match: dict):
     if combo_dt > now + timedelta(seconds=30):
         sched.add_job(
             cricket_combo_job, "date", run_date=combo_dt,
-            args=[application, match_id],
+            args=[match_id],
             id=f"cricket_combo::{match_id}",
             replace_existing=True, misfire_grace_time=1800
         )
@@ -661,7 +673,7 @@ def schedule_cricket_match(application, sched: AsyncIOScheduler, match: dict):
     if start_dt > now + timedelta(seconds=30):
         sched.add_job(
             cricket_live_alert_job, "date", run_date=start_dt,
-            args=[application, match_id],
+            args=[match_id],
             id=f"cricket_live::{match_id}",
             replace_existing=True, misfire_grace_time=1800
         )
@@ -674,7 +686,7 @@ def schedule_cricket_match(application, sched: AsyncIOScheduler, match: dict):
     if recap_dt > now + timedelta(seconds=30):
         sched.add_job(
             cricket_recap_job, "date", run_date=recap_dt,
-            args=[application, match_id],
+            args=[match_id],
             id=f"cricket_recap::{match_id}",
             replace_existing=True, misfire_grace_time=3600
         )
@@ -684,11 +696,13 @@ def schedule_cricket_match(application, sched: AsyncIOScheduler, match: dict):
 
     return jobs_added
 
-async def daily_cricket_fetch_job(application):
+async def daily_cricket_fetch_job():
     """
     Runs at 07:00 IST every morning.
     Fetches today's matches and schedules their posts.
+    Uses module-level _APP so this function is picklable for SQLAlchemy jobstore.
     """
+    application = _APP
     log.info("Daily cricket fetch starting...")
     sched: AsyncIOScheduler = application.bot_data.get("scheduler")
     if not sched:
@@ -703,7 +717,7 @@ async def daily_cricket_fetch_job(application):
     count = 0
     for match in matches:
         save_match_to_db(match)
-        jobs = schedule_cricket_match(application, sched, match)
+        jobs = schedule_cricket_match(sched, match)
         count += jobs
 
     log.info("Cricket fetch done: %d matches, %d jobs scheduled", len(matches), count)
@@ -800,7 +814,9 @@ async def send_post(application, file_path: Path, caption: str,
         log.error("Failed to post %s: %s", file_path.name, e)
         return None
 
-async def post_prefill_job(application, file_name: str):
+async def post_prefill_job(file_name: str):
+    """Scheduled job — uses module-level _APP (picklable for SQLAlchemy jobstore)."""
+    application = _APP
     job_id = f"prefill::{file_name}"
     try:
         if already_sent(file_name, cycle=0):
@@ -822,7 +838,9 @@ async def post_prefill_job(application, file_name: str):
         log_fired_job(job_id, "error")
         log_bot_error(job_id, str(e))
 
-async def post_calendar_slot(application, slot_hh_mm):
+async def post_calendar_slot(slot_hh_mm):
+    """Scheduled job — uses module-level _APP (picklable for SQLAlchemy jobstore)."""
+    application = _APP
     job_id = f"cal::{slot_hh_mm[0]:02d}{slot_hh_mm[1]:02d}"
     try:
         if setting_get("paused") == "1":
@@ -1135,7 +1153,7 @@ async def cmd_forcematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines = [f"Cricbuzz se {len(matches)} match(es) mila:\n"]
         for match in matches:
             save_match_to_db(match)
-            jobs = schedule_cricket_match(ctx.application, sched, match) if sched else 0
+            jobs = schedule_cricket_match(sched, match) if sched else 0
             total_jobs += jobs
             lines.append(
                 f"  {match['team1']} vs {match['team2']} @ "
@@ -1173,7 +1191,7 @@ async def cmd_forcematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sched: AsyncIOScheduler = ctx.application.bot_data.get("scheduler")
     jobs = 0
     if sched:
-        jobs = schedule_cricket_match(ctx.application, sched, match)
+        jobs = schedule_cricket_match(sched, match)
     await update.message.reply_text(
         f"Match added: {t1} vs {t2} at {hh:02d}:{mm:02d} IST\n"
         f"Match ID: {match_id}\n"
@@ -1373,7 +1391,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # SCHEDULER WIRING
 # ---------------------------------------------------------------------------
-def build_scheduler(application) -> AsyncIOScheduler:
+def build_scheduler() -> AsyncIOScheduler:
     # Ensure data directory exists before creating the SQLite jobstore.
     # On Railway without a Volume attached, DATA_DIR may not exist — we create it.
     # If creation fails (read-only FS), fall back to MemoryJobStore gracefully.
@@ -1413,7 +1431,7 @@ def build_scheduler(application) -> AsyncIOScheduler:
             continue
         job_id = f"prefill::{file_name}"
         sched.add_job(post_prefill_job, "date", run_date=ts,
-                      args=[application, file_name], id=job_id,
+                      args=[file_name], id=job_id,
                       replace_existing=True, misfire_grace_time=3600)
         log.info("Scheduled pre-fill %s at %s", file_name,
                  ts.strftime("%a %d %b %H:%M %Z"))
@@ -1423,7 +1441,7 @@ def build_scheduler(application) -> AsyncIOScheduler:
         job_id = f"cal::{hh:02d}{mm:02d}"
         sched.add_job(post_calendar_slot, CronTrigger(hour=hh, minute=mm,
                                                        timezone=TZ),
-                      args=[application, (hh, mm)], id=job_id,
+                      args=[(hh, mm)], id=job_id,
                       replace_existing=True, misfire_grace_time=600)
         log.info("Scheduled daily calendar slot %02d:%02d IST", hh, mm)
 
@@ -1432,7 +1450,7 @@ def build_scheduler(application) -> AsyncIOScheduler:
     # replace_existing=True in add_job handles the deduplication.
     sched.add_job(
         daily_cricket_fetch_job, CronTrigger(hour=7, minute=0, timezone=TZ),
-        args=[application], id="cricket_daily_fetch",
+        args=[], id="cricket_daily_fetch",
         replace_existing=True, misfire_grace_time=3600
     )
     log.info("Scheduled daily cricket fetch at 07:00 IST")
@@ -1443,8 +1461,10 @@ def build_scheduler(application) -> AsyncIOScheduler:
 # STARTUP
 # ---------------------------------------------------------------------------
 async def post_init(application):
+    global _APP
+    _APP = application   # store globally so job functions can access it without pickling
     init_db()
-    sched = build_scheduler(application)
+    sched = build_scheduler()
     sched.start()
     application.bot_data["scheduler"] = sched
 
@@ -1481,7 +1501,7 @@ async def post_init(application):
     # Run cricket fetch on EVERY boot so DB is never empty after redeploy
     log.info("Running cricket fetch on boot (every startup)...")
     try:
-        await daily_cricket_fetch_job(application)
+        await daily_cricket_fetch_job()
     except Exception as e:
         log.error("Boot cricket fetch failed: %s", e)
 
