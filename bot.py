@@ -55,7 +55,7 @@ _APP = None   # set in post_init before scheduler starts
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-BOT_VERSION = "2.6.0"
+BOT_VERSION = "2.6.1"
 RAILWAY_DEPLOYMENT_ID = os.environ.get("RAILWAY_DEPLOYMENT_ID", "")
 RAILWAY_GIT_COMMIT_SHA = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
 RAILWAY_ENVIRONMENT_NAME = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "")
@@ -1232,100 +1232,126 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Plain-text status report. v2.6.1: no markdown to avoid Telegram parse
+    errors caused by underscores in job IDs (cricket_live, recap_helper, etc).
+    Wrapped in try/except with plain-text fallback so it can never silently
+    fail."""
     if not is_admin(update.effective_chat.id):
         return
-    sched: AsyncIOScheduler = ctx.application.bot_data["scheduler"]
-    jobs = sorted(sched.get_jobs(),
-                  key=lambda j: j.next_run_time or datetime.max.replace(tzinfo=TZ))
-    paused = setting_get("paused") == "1"
-    cricket_paused = setting_get("cricket_paused") == "1"
-    today = datetime.now(TZ).date()
+    try:
+        sched: AsyncIOScheduler = ctx.application.bot_data["scheduler"]
+        jobs = sorted(sched.get_jobs(),
+                      key=lambda j: j.next_run_time or datetime.max.replace(tzinfo=TZ))
+        paused = setting_get("paused") == "1"
+        cricket_paused = setting_get("cricket_paused") == "1"
+        today = datetime.now(TZ).date()
 
-    uptime = datetime.now(TZ) - BOT_BOOT_TS
-    uptime_str = f"{uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds // 60) % 60}m"
-    deploy_short = (RAILWAY_GIT_COMMIT_SHA or "")[:7] or "local"
+        uptime = datetime.now(TZ) - BOT_BOOT_TS
+        uptime_str = f"{uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds // 60) % 60}m"
+        deploy_short = (RAILWAY_GIT_COMMIT_SHA or "")[:7] or "local"
 
-    lines = ["*GurudevBook Bot Status*"]
-    lines.append(f"Time:    {datetime.now(TZ).strftime('%H:%M:%S %Z')}")
-    lines.append(f"Version: `v{BOT_VERSION}` (deploy `{deploy_short}`)")
-    lines.append(f"Uptime:  {uptime_str}")
+        if paused:
+            mode = "PAUSED (all posts)"
+        elif cricket_paused:
+            mode = "Cricket PAUSED (fallback active)"
+        else:
+            mode = "Active"
 
-    if paused:
-        lines.append("Mode:    ⏸ PAUSED (all posts)")
-    elif cricket_paused:
-        lines.append("Mode:    🏏 Cricket PAUSED (fallback active)")
-    else:
-        lines.append("Mode:    ✅ Active")
+        lines = ["=== GurudevBook Bot Status ==="]
+        lines.append(f"Time:    {datetime.now(TZ).strftime('%H:%M:%S %Z')}")
+        lines.append(f"Version: v{BOT_VERSION}  (deploy {deploy_short})")
+        lines.append(f"Uptime:  {uptime_str}")
+        lines.append(f"Mode:    {mode}")
 
-    # Today's queue (full list)
-    today_jobs = [j for j in jobs if j.next_run_time
-                  and j.next_run_time.astimezone(TZ).date() == today]
-    lines.append(f"\n*Today's Queue ({len(today_jobs)} posts):*")
-    if not today_jobs:
-        lines.append("  (none)")
-    else:
-        for j in today_jobs[:30]:
-            t = j.next_run_time.astimezone(TZ).strftime("%H:%M")
-            label = j.id.split("::")[0] if "::" in j.id else j.id
-            tail = f" ({j.id.split('::')[-1]})" if "::" in j.id else ""
-            lines.append(f"  ⌛ {t} — {label}{tail}")
+        today_jobs = [j for j in jobs if j.next_run_time
+                      and j.next_run_time.astimezone(TZ).date() == today]
+        lines.append("")
+        lines.append(f"--- Today's Queue ({len(today_jobs)} posts) ---")
+        if not today_jobs:
+            lines.append("  (none)")
+        else:
+            for j in today_jobs[:30]:
+                t = j.next_run_time.astimezone(TZ).strftime("%H:%M")
+                lines.append(f"  {t}  {j.id}")
 
-    # History
-    history = get_last_fired_jobs(5)
-    if history:
-        lines.append("\n*Last 5 Fired:*")
-        for jid, fat, stat in history:
-            ts = datetime.fromisoformat(fat).astimezone(TZ).strftime("%H:%M")
-            icon = "✅" if stat == "ok" else "❌"
-            lines.append(f"  {icon} {ts} — {jid}")
+        history = get_last_fired_jobs(5)
+        if history:
+            lines.append("")
+            lines.append("--- Last 5 Fired ---")
+            for jid, fat, stat in history:
+                ts = datetime.fromisoformat(fat).astimezone(TZ).strftime("%H:%M")
+                icon = "OK" if stat == "ok" else "FAIL"
+                lines.append(f"  [{icon}] {ts}  {jid}")
 
-    # Last 5 errors
-    failed = get_last_failed_jobs(5)
-    if failed:
-        lines.append("\n*Last 5 Failed Jobs:*")
-        for jid, fat in failed:
-            ts = datetime.fromisoformat(fat).astimezone(TZ).strftime("%d %b %H:%M")
-            lines.append(f"  ❌ {ts} — `{jid}`")
+        failed = get_last_failed_jobs(5)
+        if failed:
+            lines.append("")
+            lines.append("--- Last 5 Failed Jobs ---")
+            for jid, fat in failed:
+                ts = datetime.fromisoformat(fat).astimezone(TZ).strftime("%d %b %H:%M")
+                lines.append(f"  [FAIL] {ts}  {jid}")
 
-    last_err = get_last_error()
-    if last_err:
-        lines.append(f"\n*Last Error:*\n`{last_err[:200]}`")
+        last_err = get_last_error()
+        if last_err:
+            lines.append("")
+            lines.append("--- Last Error ---")
+            lines.append(f"  {last_err[:300]}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        text = "\n".join(lines)
+        # Telegram message limit is 4096; trim to be safe
+        if len(text) > 4000:
+            text = text[:3990] + "\n… (truncated)"
+        await update.message.reply_text(text)  # plain text, no parse_mode
+    except Exception as e:
+        log.exception("cmd_status crashed")
+        try:
+            await update.message.reply_text(
+                f"/status crashed: {type(e).__name__}: {e}\n"
+                f"Bot is alive (v{BOT_VERSION}) but status report failed."
+            )
+        except Exception:
+            pass
+        try:
+            await record_failure("cmd_status", f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
 
 async def cmd_healthcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Manually trigger Cricbuzz fetch + post simulation. Reports back to admin
-    inline (and also routes any failure through the admin alert pipeline)."""
+    """Manually trigger Cricbuzz fetch + post simulation. v2.6.1: plain text,
+    wrapped in try/except so it can never silently fail."""
     if not is_admin(update.effective_chat.id):
         return
-    await update.message.reply_text("⏳ Running healthcheck…")
-    lines = ["*Healthcheck Report*"]
-    lines.append(f"Version: `v{BOT_VERSION}`")
+    try:
+        await update.message.reply_text("Running healthcheck...")
+    except Exception:
+        pass
+    lines = ["=== Healthcheck Report ==="]
+    lines.append(f"Version: v{BOT_VERSION}")
     deploy_short = (RAILWAY_GIT_COMMIT_SHA or "")[:7] or "local"
-    deploy_id_short = (RAILWAY_DEPLOYMENT_ID or "")[:8] or "—"
-    lines.append(f"Deploy:  `{deploy_short}` (Railway id `{deploy_id_short}`)")
-    lines.append(f"Env:     `{RAILWAY_ENVIRONMENT_NAME or 'local'}`")
+    deploy_id_short = (RAILWAY_DEPLOYMENT_ID or "")[:8] or "-"
+    lines.append(f"Deploy:  {deploy_short}  (Railway id {deploy_id_short})")
+    lines.append(f"Env:     {RAILWAY_ENVIRONMENT_NAME or 'local'}")
     lines.append("")
 
     # 1) Cricbuzz fetch
     try:
         matches = fetch_today_cricket_matches()
         if matches:
-            lines.append(f"✅ Cricbuzz: {len(matches)} match(es) for today")
+            lines.append(f"[OK] Cricbuzz: {len(matches)} match(es) for today")
             for m in matches[:5]:
-                lines.append(f"  • `{m['match_id']}` {m['team1']} vs {m['team2']} — {m['start_dt_ist'].strftime('%H:%M')} (state: {m['state']})")
+                lines.append(f"  - {m['match_id']} {m['team1']} vs {m['team2']} — {m['start_dt_ist'].strftime('%H:%M')} (state: {m['state']})")
         else:
-            lines.append("⚠️ Cricbuzz: 0 matches for today")
+            lines.append("[WARN] Cricbuzz: 0 matches for today")
     except Exception as e:
-        lines.append(f"❌ Cricbuzz: {type(e).__name__}: {e}")
+        lines.append(f"[FAIL] Cricbuzz: {type(e).__name__}: {e}")
 
     # 2) Posters dir
     try:
         per_match_count = len(list((CRICKET_DIR / "per_match").glob("*.png"))) if (CRICKET_DIR / "per_match").exists() else 0
         generic_count = len(list(CRICKET_DIR.glob("*.png")))
-        lines.append(f"✅ Posters: {per_match_count} per-match + {generic_count} generic")
+        lines.append(f"[OK] Posters: {per_match_count} per-match + {generic_count} generic")
     except Exception as e:
-        lines.append(f"❌ Posters: {type(e).__name__}: {e}")
+        lines.append(f"[FAIL] Posters: {type(e).__name__}: {e}")
 
     # 3) Proofs queue
     try:
@@ -1333,26 +1359,38 @@ async def cmd_healthcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with db() as c:
             sent = c.execute("SELECT COUNT(*) FROM sent_proofs").fetchone()[0]
         remaining = max(0, len(queue) - sent)
-        lines.append(f"✅ Proofs: {remaining} remaining of {len(queue)}")
+        lines.append(f"[OK] Proofs: {remaining} remaining of {len(queue)}")
     except Exception as e:
-        lines.append(f"❌ Proofs: {type(e).__name__}: {e}")
+        lines.append(f"[FAIL] Proofs: {type(e).__name__}: {e}")
 
     # 4) Telegram channel reachability
     try:
         chat = await ctx.application.bot.get_chat(CHANNEL)
-        lines.append(f"✅ Telegram: channel `{CHANNEL}` reachable (members ≈ {getattr(chat, 'member_count', 'n/a')})")
+        lines.append(f"[OK] Telegram: channel {CHANNEL} reachable (members ~ {getattr(chat, 'member_count', 'n/a')})")
     except Exception as e:
-        lines.append(f"❌ Telegram: {type(e).__name__}: {e}")
+        lines.append(f"[FAIL] Telegram: {type(e).__name__}: {e}")
 
     # 5) Scheduler
     try:
         sched = ctx.application.bot_data.get("scheduler")
         n = len(sched.get_jobs()) if sched else 0
-        lines.append(f"✅ Scheduler: {n} jobs queued")
+        lines.append(f"[OK] Scheduler: {n} jobs queued")
     except Exception as e:
-        lines.append(f"❌ Scheduler: {type(e).__name__}: {e}")
+        lines.append(f"[FAIL] Scheduler: {type(e).__name__}: {e}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "\n… (truncated)"
+    try:
+        await update.message.reply_text(text)
+    except Exception as e:
+        log.exception("cmd_healthcheck reply failed")
+        try:
+            await update.message.reply_text(
+                f"/healthcheck reply failed: {type(e).__name__}: {e}"
+            )
+        except Exception:
+            pass
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id):
@@ -2099,6 +2137,27 @@ def main():
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("healthcheck", cmd_healthcheck))
     application.add_handler(CommandHandler("list", cmd_list))
+
+    # v2.6.1: Global PTB error handler so no command/handler can fail silently.
+    async def _global_error_handler(update_obj, ctx_obj):
+        err = ctx_obj.error
+        log.exception("Unhandled error in PTB handler: %s", err)
+        try:
+            await record_failure(
+                "ptb_handler",
+                f"{type(err).__name__}: {err}",
+                level=ALERT_LEVEL_ERROR,
+            )
+        except Exception:
+            pass
+        try:
+            if isinstance(update_obj, Update) and update_obj.effective_message:
+                await update_obj.effective_message.reply_text(
+                    f"⚠️ Handler error: {type(err).__name__}: {str(err)[:200]}"
+                )
+        except Exception:
+            pass
+    application.add_error_handler(_global_error_handler)
     application.add_handler(CommandHandler("skip", cmd_skip))
     application.add_handler(CommandHandler("pause", cmd_pause))
     application.add_handler(CommandHandler("resume", cmd_resume))
