@@ -1377,16 +1377,15 @@ AUTO_REPLIES = {
         f"\u2022 *Aviator* (crash game, fast cashouts)\n"
         f"\u2022 *Dragon Tiger* (1 round = 30 sec)\n"
         f"\u2022 *Roulette* (European + Lightning)\n\n"
-        f"Naye members ko 100% welcome bonus milta hai. Register karo:\n{REGISTER_URL}\n"
+        f"Naye members ko 30% welcome bonus milta hai (up to \u20B91,000). Register karo:\n{REGISTER_URL}\n"
         f"WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
     # ---- BONUS ----
     "bonus": (
         f"*BONUS OFFERS*\n\n"
-        f"\u2022 *Welcome Bonus:* 100% up to \u20B910,000 on first deposit\n"
-        f"\u2022 *Reload Bonus:* 25% on every deposit \u20B91000+\n"
-        f"\u2022 *Refer & Earn:* \u20B9500 per active referral\n\n"
-        f"Claim karo:\n{REGISTER_URL}\n"
+        f"\u2022 *Welcome Bonus:* 30% bonus on first deposit (up to \u20B91,000). T&C apply.\n"
+        f"\u2022 *Recurring Bonus:* 5% bonus on every deposit (up to \u20B91,000). T&C apply.\n\n"
+        f"Claim karne ke liye register karein:\n{REGISTER_URL}\n"
         f"WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
     # ---- VIP ----
@@ -1424,7 +1423,7 @@ AUTO_REPLIES = {
         f"*REGISTER IN 3 STEPS*\n\n"
         f"1\ufe0f\u20E3 Open: {REGISTER_URL}\n"
         f"2\ufe0f\u20E3 Apna mobile number + email enter karo\n"
-        f"3\ufe0f\u20E3 First deposit karo aur 100% bonus claim karo\n\n"
+        f"3\ufe0f\u20E3 First deposit karo aur 30% welcome bonus claim karo\n\n"
         f"Confirmation ke baad apna username yahan bhej do for VIP access.\n"
         f"Need help? WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
@@ -1442,7 +1441,8 @@ AUTO_REPLIES = {
         f"*DEPOSITS \u2014 INSTANT*\n\n"
         f"\u2022 *Min:* \u20B9100\n"
         f"\u2022 *Methods:* UPI / Net Banking / Crypto\n"
-        f"\u2022 *Bonus:* 100% match on first deposit\n\n"
+        f"\u2022 *Welcome Bonus:* 30% on first deposit\n"
+        f"\u2022 *Deposit Bonus:* 5% on every deposit\n\n"
         f"Deposit page:\n{REGISTER_URL}\n"
         f"WhatsApp: {WHATSAPP_LINK}" + DISCLAIMER
     ),
