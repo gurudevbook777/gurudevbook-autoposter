@@ -97,14 +97,22 @@ SLOT_TIME_MAP = {
     "2130": (21, 30),
 }
 
-# Cricket: only post for these series keywords (IPL, international, major T20 leagues)
+# Cricket league whitelist: IPL 2026 + India national-team internationals only.
+# Skip everything else (PSL, BBL, CPL, county, women's non-India, qualifiers,
+# T20I tours not involving India).
 CRICKET_SERIES_KEYWORDS = [
     "ipl", "indian premier league",
-    "test", "odi", "t20i", "t20 international",
-    "world cup", "champions trophy", "asia cup",
-    "bbl", "psl", "sa20", "cpl", "the hundred",
-    "icc", "bilateral",
 ]
+# Series patterns that ALSO qualify as India-internationals (slug must contain one of these)
+INDIA_INTERNATIONAL_KEYWORDS = [
+    "india tour", "tour of india",
+    "india vs", "vs india",
+    "asia cup", "world cup", "champions trophy",
+]
+# Hard cap: max 2 cricket matches scheduled per day (avoids channel spam).
+CRICKET_MAX_MATCHES_PER_DAY = int(os.environ.get("CRICKET_MAX_MATCHES_PER_DAY", "2"))
+# Minimum spacing between two adjacent cricket posts (seconds)
+CRICKET_MIN_SPACING_SECONDS = int(os.environ.get("CRICKET_MIN_SPACING_SECONDS", "300"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -255,9 +263,21 @@ def _fetch_cricbuzz_raw() -> str:
     with urllib.request.urlopen(req, timeout=15) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
-def _is_relevant_series(series_name: str) -> bool:
-    sl = series_name.lower()
-    return any(kw in sl for kw in CRICKET_SERIES_KEYWORDS)
+def _is_relevant_series(series_name: str, slug: str = "") -> bool:
+    """
+    True if this match is IPL 2026 OR an India national-team international.
+    Both `series_name` and `slug` are checked (slug is more reliable on Cricbuzz).
+    """
+    haystack = (series_name + " " + slug).lower()
+    if any(kw in haystack for kw in CRICKET_SERIES_KEYWORDS):
+        return True
+    if any(kw in haystack for kw in INDIA_INTERNATIONAL_KEYWORDS):
+        return True
+    # Slug like "ind-vs-aus-..." or "aus-vs-ind-..." or team code IND
+    parts = slug.lower().split("-")
+    if "ind" in parts or "india" in parts:
+        return True
+    return False
 
 def fetch_today_cricket_matches() -> list[dict]:
     """
@@ -314,7 +334,7 @@ def fetch_today_cricket_matches() -> list[dict]:
 
         # Determine series from slug tail
         series = slug.replace("-", " ").title()
-        if not _is_relevant_series(series):
+        if not _is_relevant_series(series, slug):
             continue
 
         # Find the closest startDate timestamp to this match_id in the raw text
@@ -378,8 +398,22 @@ def fetch_today_cricket_matches() -> list[dict]:
             seen.add(m["match_id"])
             unique.append(m)
 
+    # Sort by start time and apply hard cap (max N matches/day)
+    unique.sort(key=lambda m: m["start_ts"])
+    if len(unique) > CRICKET_MAX_MATCHES_PER_DAY:
+        log.info("Capping cricket matches: %d found, keeping first %d",
+                 len(unique), CRICKET_MAX_MATCHES_PER_DAY)
+        unique = unique[:CRICKET_MAX_MATCHES_PER_DAY]
     log.info("Fetched %d relevant cricket matches for today", len(unique))
     return unique
+
+def cricket_variant_for_match(match_id: str) -> tuple[int, str, str]:
+    """Per-match variant rotation (V1/V3/V4) so multiple matches on the same
+    day get visually distinct posters. Stable hash of match_id ensures the
+    same match always gets the same variant on every redeploy."""
+    h = sum(ord(c) for c in str(match_id))
+    idx = h % len(CRICKET_VARIANTS)
+    return idx, CRICKET_VARIANTS[idx], CRICKET_VARIANT_NAMES[idx]
 
 def save_match_to_db(match: dict):
     with db() as c:
@@ -594,8 +628,9 @@ async def post_text_to_channel(text: str, match_id: str, post_type: str):
         log.info("Cricket post %s/%s already sent", match_id, post_type)
         return
     try:
-        # Try poster image (rotation V1/V3/V4)
-        _, variant_file, _ = cricket_variant_for_today()
+        # Per-match poster rotation (V1/V3/V4 by hash of match_id)
+        # so multiple matches on the same day get visually distinct posters.
+        _, variant_file, _ = cricket_variant_for_match(match_id)
         poster_path = CRICKET_DIR / variant_file
         if poster_path.exists():
             with open(poster_path, "rb") as fh:
