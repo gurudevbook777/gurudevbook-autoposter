@@ -55,10 +55,16 @@ _APP = None   # set in post_init before scheduler starts
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
+BOT_VERSION = "2.6.0"
+RAILWAY_DEPLOYMENT_ID = os.environ.get("RAILWAY_DEPLOYMENT_ID", "")
+RAILWAY_GIT_COMMIT_SHA = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
+RAILWAY_ENVIRONMENT_NAME = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "")
+
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHANNEL = os.environ.get("CHANNEL_USERNAME", "@gurudevbook_official")
 TZ_NAME = os.environ.get("TIMEZONE", "Asia/Kolkata")
 TZ = pytz.timezone(TZ_NAME)
+BOT_BOOT_TS = datetime.now(TZ)
 REGISTER_URL = os.environ.get("REGISTER_URL", "https://gurudevbook.com/register")
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -245,6 +251,87 @@ def get_last_fired_jobs(n: int = 5) -> list:
             "SELECT job_id, fired_at, status FROM fired_jobs_log ORDER BY id DESC LIMIT ?", (n,)
         ).fetchall()
     return rows
+
+def get_last_errors(n: int = 5) -> list:
+    with db() as c:
+        rows = c.execute(
+            "SELECT occurred_at, context, error FROM bot_errors ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+    return rows
+
+def get_last_failed_jobs(n: int = 5) -> list:
+    with db() as c:
+        rows = c.execute(
+            "SELECT job_id, fired_at FROM fired_jobs_log WHERE status!='ok' ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+    return rows
+
+# ---------------------------------------------------------------------------
+# ADMIN ALERT HELPER (v2.6.0 proactive monitoring)
+# Every issue (post failure, missing image, parser empty, Telegram API error,
+# caption-too-long, scheduler skip, version mismatch, unhandled exception)
+# routes through record_failure() which (a) writes to bot_errors DB and
+# (b) sends a DM to the claimed admin via notify_admin_async().
+# ---------------------------------------------------------------------------
+ALERT_LEVEL_INFO = "INFO"
+ALERT_LEVEL_WARN = "WARN"
+ALERT_LEVEL_ERROR = "ERROR"
+
+_ALERT_DEDUPE = {}  # context -> last_sent_ts; throttle identical alerts to 1/5min
+
+async def notify_admin_async(text: str, level: str = ALERT_LEVEL_ERROR,
+                              dedupe_key: Optional[str] = None) -> None:
+    """DM the claimed admin. Soft-fails on errors so it can never crash a job.
+    Throttles repeated identical alerts (same dedupe_key) to one per 5 minutes."""
+    try:
+        application = _APP
+        if application is None:
+            return
+        admin_id = setting_get("admin_chat_id")
+        if not admin_id:
+            log.warning("Admin alert suppressed (no admin claimed): %s", text[:120])
+            return
+        # Dedupe
+        if dedupe_key:
+            now = datetime.now(TZ).timestamp()
+            last = _ALERT_DEDUPE.get(dedupe_key, 0)
+            if now - last < 300:  # 5 minutes
+                return
+            _ALERT_DEDUPE[dedupe_key] = now
+        emoji = {"INFO": "ℹ️", "WARN": "⚠️", "ERROR": "🚨"}.get(level, "🔔")
+        prefix = f"{emoji} *{level}* — {datetime.now(TZ).strftime('%H:%M IST')}\n"
+        msg = prefix + text
+        # Telegram caption limit safety
+        if len(msg) > 3900:
+            msg = msg[:3900] + "…"
+        await application.bot.send_message(
+            chat_id=int(admin_id), text=msg, parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        log.error("notify_admin_async itself failed: %s", e)
+
+def notify_admin_sync(text: str, level: str = ALERT_LEVEL_ERROR,
+                      dedupe_key: Optional[str] = None) -> None:
+    """Schedule an admin DM from sync code (e.g. inside a non-async helper).
+    Uses the running asyncio loop if available; otherwise just logs."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(notify_admin_async(text, level, dedupe_key))
+        else:
+            log.warning("notify_admin_sync called outside running loop: %s", text[:120])
+    except Exception as e:
+        log.error("notify_admin_sync failed: %s", e)
+
+async def record_failure(context: str, error: str,
+                          level: str = ALERT_LEVEL_ERROR,
+                          extra: Optional[str] = None) -> None:
+    """Single funnel for any issue: write to DB AND DM admin."""
+    log_bot_error(context, error)
+    body = f"*Context:* `{context}`\n*Error:* {error[:400]}"
+    if extra:
+        body += f"\n{extra}"
+    await notify_admin_async(body, level=level, dedupe_key=context)
 
 # ---------------------------------------------------------------------------
 # CRICKET ENGINE — FIXTURE FETCHING
@@ -607,6 +694,17 @@ async def post_text_to_channel(text: str, match_id: str, post_type: str):
     if cricket_post_already_sent(match_id, post_type):
         log.info("Cricket post %s/%s already sent", match_id, post_type)
         return
+    # Pre-check: caption length (Telegram photo caption limit is 1024 chars,
+    # message text limit is 4096). We pick photo path if poster exists, so use
+    # 1024 as the conservative ceiling and warn admin before truncating.
+    if len(text) > 1024:
+        await notify_admin_async(
+            f"Caption character limit exceeded for cricket {post_type} (match {match_id}): "
+            f"{len(text)} chars > 1024. Will truncate.",
+            level=ALERT_LEVEL_WARN,
+            dedupe_key=f"caption_long::{post_type}::{match_id}",
+        )
+        text = text[:1020] + "…"
     try:
         # 1) Try high-res per-match poster (correct captains, venue, date, V1/V3/V4 baked-in)
         # 2) Fall back to generic V1/V3/V4 rotation if no per-match poster on disk.
@@ -622,6 +720,12 @@ async def post_text_to_channel(text: str, match_id: str, post_type: str):
                     chat_id=CHANNEL, photo=fh, caption=text
                 )
         else:
+            await notify_admin_async(
+                f"Image file missing for cricket {post_type} (match {match_id}): "
+                f"`{poster_path}` not found. Falling back to text-only.",
+                level=ALERT_LEVEL_WARN,
+                dedupe_key=f"img_missing::{post_type}::{match_id}",
+            )
             msg = await application.bot.send_message(
                 chat_id=CHANNEL, text=text, disable_web_page_preview=True
             )
@@ -630,7 +734,12 @@ async def post_text_to_channel(text: str, match_id: str, post_type: str):
                  post_type, match_id, msg.message_id, variant_file)
     except Exception as e:
         log.error("Cricket post failed (%s/%s): %s", match_id, post_type, e)
-        log_bot_error(f"cricket_post::{post_type}::{match_id}", str(e))
+        await record_failure(
+            f"cricket_post::{post_type}::{match_id}",
+            f"{type(e).__name__}: {e}",
+            level=ALERT_LEVEL_ERROR,
+            extra=f"Match: {match_id} | Type: {post_type} | Caption len: {len(text)}",
+        )
 
 async def cricket_preview_job(match_id: str):
     job_id = f"cricket_preview::{match_id}"
@@ -646,7 +755,7 @@ async def cricket_preview_job(match_id: str):
     except Exception as e:
         log.error("Cricket preview job failed for %s: %s", match_id, e)
         log_fired_job(job_id, "error")
-        log_bot_error(job_id, str(e))
+        await record_failure(job_id, f"{type(e).__name__}: {e}")
 
 async def cricket_combo_job(match_id: str):
     job_id = f"cricket_combo::{match_id}"
@@ -662,7 +771,7 @@ async def cricket_combo_job(match_id: str):
     except Exception as e:
         log.error("Cricket combo job failed for %s: %s", match_id, e)
         log_fired_job(job_id, "error")
-        log_bot_error(job_id, str(e))
+        await record_failure(job_id, f"{type(e).__name__}: {e}")
 
 async def cricket_live_alert_job(match_id: str):
     job_id = f"cricket_live::{match_id}"
@@ -678,7 +787,7 @@ async def cricket_live_alert_job(match_id: str):
     except Exception as e:
         log.error("Cricket live alert job failed for %s: %s", match_id, e)
         log_fired_job(job_id, "error")
-        log_bot_error(job_id, str(e))
+        await record_failure(job_id, f"{type(e).__name__}: {e}")
 
 async def cricket_recap_job(match_id: str):
     """
@@ -701,7 +810,7 @@ async def cricket_recap_job(match_id: str):
     except Exception as e:
         log.error("Cricket recap job failed for %s: %s", match_id, e)
         log_fired_job(job_id, "error")
-        log_bot_error(job_id, str(e))
+        await record_failure(job_id, f"{type(e).__name__}: {e}")
 
 def schedule_cricket_match(sched: AsyncIOScheduler, match: dict):
     """Add 4 jobs for a single match: preview, combo, live alert, recap.
@@ -751,6 +860,20 @@ def schedule_cricket_match(sched: AsyncIOScheduler, match: dict):
                  match_id, start_dt.strftime("%H:%M"))
         jobs_added += 1
 
+    # Recap helper: 2 hours after start (30 min before auto-recap). DMs admin
+    # if no /win or /loss received yet so they can override or let auto run.
+    helper_dt = start_dt + timedelta(hours=2)
+    if helper_dt > now + timedelta(seconds=30):
+        sched.add_job(
+            recap_helper_job, "date", run_date=helper_dt,
+            args=[match_id],
+            id=f"recap_helper::{match_id}",
+            replace_existing=True, misfire_grace_time=1800
+        )
+        log.info("Scheduled cricket RECAP HELPER for %s at %s IST",
+                 match_id, helper_dt.strftime("%H:%M"))
+        jobs_added += 1
+
     # Recap: 2.5 hours after match start (admin has 2h to send /win or /loss)
     recap_dt = start_dt + timedelta(hours=2, minutes=30)
     if recap_dt > now + timedelta(seconds=30):
@@ -777,11 +900,36 @@ async def daily_cricket_fetch_job():
     sched: AsyncIOScheduler = application.bot_data.get("scheduler")
     if not sched:
         log.error("Scheduler not found in bot_data")
+        await record_failure(
+            "daily_cricket_fetch",
+            "Scheduler not found in bot_data — cricket schedule cannot be built.",
+        )
         return
 
-    matches = fetch_today_cricket_matches()
+    try:
+        matches = fetch_today_cricket_matches()
+    except Exception as e:
+        log.error("Cricbuzz fetch raised: %s", e)
+        await record_failure(
+            "daily_cricket_fetch::exception",
+            f"{type(e).__name__}: {e}",
+            extra="Cricbuzz endpoint may have changed format. Check parser.",
+        )
+        return
+
+    today = datetime.now(TZ).date()
     if not matches:
+        # During the IPL season we expect at least 1 IPL match daily, so a
+        # zero-match return is suspicious. Alert the admin so they can confirm
+        # whether (a) it's a genuine off-day or (b) parser/whitelist broke.
         log.info("No relevant cricket matches today — fallback posts will run")
+        await record_failure(
+            "daily_cricket_fetch::empty",
+            f"Cricbuzz fetch returned 0 relevant matches for {today}.",
+            level=ALERT_LEVEL_WARN,
+            extra=("If today is an IPL day, parser/whitelist is broken. "
+                   "Run /healthcheck to inspect."),
+        )
         return
 
     count = 0
@@ -791,6 +939,11 @@ async def daily_cricket_fetch_job():
         count += jobs
 
     log.info("Cricket fetch done: %d matches, %d jobs scheduled", len(matches), count)
+    await notify_admin_async(
+        f"✅ Daily cricket fetch ok: *{len(matches)}* matches, *{count}* jobs scheduled for {today}.",
+        level=ALERT_LEVEL_INFO,
+        dedupe_key=f"daily_fetch_ok::{today}",
+    )
 
 # ---------------------------------------------------------------------------
 # REAL PROOFS QUEUE — separate channel @gurudevbookproofs, no-repeat tracker
@@ -847,7 +1000,10 @@ async def post_proof_job(slot_hh_mm):
         proof_path = PROOFS_DIR / slot["file"]
         if not proof_path.exists():
             log.warning("Proof file missing: %s", proof_path)
-            log_bot_error(job_id, f"missing proof file {slot['file']}")
+            await record_failure(
+                job_id, f"Proof file missing: {slot['file']}",
+                level=ALERT_LEVEL_WARN,
+            )
             return
         # Append WhatsApp link if not already present in caption
         caption = slot.get("caption", "").strip()
@@ -864,7 +1020,7 @@ async def post_proof_job(slot_hh_mm):
     except Exception as e:
         log.error("Proof job failed for slot %s: %s", slot_hh_mm, e)
         log_fired_job(job_id, "error")
-        log_bot_error(job_id, str(e))
+        await record_failure(job_id, f"{type(e).__name__}: {e}")
 
 # ---------------------------------------------------------------------------
 # CONTENT LOADER (unchanged from v1)
@@ -980,7 +1136,7 @@ async def post_prefill_job(file_name: str):
     except Exception as e:
         log.error("Prefill job failed for %s: %s", file_name, e)
         log_fired_job(job_id, "error")
-        log_bot_error(job_id, str(e))
+        await record_failure(job_id, f"{type(e).__name__}: {e}")
 
 async def post_calendar_slot(slot_hh_mm):
     """Scheduled job — uses module-level _APP (picklable for SQLAlchemy jobstore)."""
@@ -1022,7 +1178,7 @@ async def post_calendar_slot(slot_hh_mm):
     except Exception as e:
         log.error("Calendar job failed for %s: %s", slot_hh_mm, e)
         log_fired_job(job_id, "error")
-        log_bot_error(job_id, str(e))
+        await record_failure(job_id, f"{type(e).__name__}: {e}")
 
 # ---------------------------------------------------------------------------
 # ADMIN COMMANDS
@@ -1083,42 +1239,119 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                   key=lambda j: j.next_run_time or datetime.max.replace(tzinfo=TZ))
     paused = setting_get("paused") == "1"
     cricket_paused = setting_get("cricket_paused") == "1"
-    
+    today = datetime.now(TZ).date()
+
+    uptime = datetime.now(TZ) - BOT_BOOT_TS
+    uptime_str = f"{uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds // 60) % 60}m"
+    deploy_short = (RAILWAY_GIT_COMMIT_SHA or "")[:7] or "local"
+
     lines = ["*GurudevBook Bot Status*"]
-    lines.append(f"Time: {datetime.now(TZ).strftime('%H:%M:%S %Z')}")
-    
+    lines.append(f"Time:    {datetime.now(TZ).strftime('%H:%M:%S %Z')}")
+    lines.append(f"Version: `v{BOT_VERSION}` (deploy `{deploy_short}`)")
+    lines.append(f"Uptime:  {uptime_str}")
+
     if paused:
-        lines.append("Mode: ⏸ PAUSED (all posts)")
+        lines.append("Mode:    ⏸ PAUSED (all posts)")
     elif cricket_paused:
-        lines.append("Mode: 🏏 Cricket PAUSED (fallback active)")
+        lines.append("Mode:    🏏 Cricket PAUSED (fallback active)")
     else:
-        lines.append("Mode: ✅ Active")
-    
-    lines.append(f"\n*Job Queue ({len(jobs)} total):*")
-    if not jobs:
-        lines.append("  (No jobs scheduled)")
+        lines.append("Mode:    ✅ Active")
+
+    # Today's queue (full list)
+    today_jobs = [j for j in jobs if j.next_run_time
+                  and j.next_run_time.astimezone(TZ).date() == today]
+    lines.append(f"\n*Today's Queue ({len(today_jobs)} posts):*")
+    if not today_jobs:
+        lines.append("  (none)")
     else:
-        for j in jobs[:5]:
-            nrt = j.next_run_time
-            if nrt:
-                lines.append(f"  \u231b {nrt.astimezone(TZ).strftime('%H:%M')} \u2014 {j.id}")
-            else:
-                lines.append(f"  \u231b (paused) \u2014 {j.id}")
+        for j in today_jobs[:30]:
+            t = j.next_run_time.astimezone(TZ).strftime("%H:%M")
+            label = j.id.split("::")[0] if "::" in j.id else j.id
+            tail = f" ({j.id.split('::')[-1]})" if "::" in j.id else ""
+            lines.append(f"  ⌛ {t} — {label}{tail}")
 
     # History
     history = get_last_fired_jobs(5)
     if history:
         lines.append("\n*Last 5 Fired:*")
         for jid, fat, stat in history:
-            ts = datetime.fromisoformat(fat).astimezone(TZ).strftime('%H:%M')
+            ts = datetime.fromisoformat(fat).astimezone(TZ).strftime("%H:%M")
             icon = "✅" if stat == "ok" else "❌"
-            lines.append(f"  {icon} {ts} \u2014 {jid}")
+            lines.append(f"  {icon} {ts} — {jid}")
 
-    # Errors
+    # Last 5 errors
+    failed = get_last_failed_jobs(5)
+    if failed:
+        lines.append("\n*Last 5 Failed Jobs:*")
+        for jid, fat in failed:
+            ts = datetime.fromisoformat(fat).astimezone(TZ).strftime("%d %b %H:%M")
+            lines.append(f"  ❌ {ts} — `{jid}`")
+
     last_err = get_last_error()
     if last_err:
-        lines.append(f"\n*Last Error:*\n`{last_err}`")
-    
+        lines.append(f"\n*Last Error:*\n`{last_err[:200]}`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_healthcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Manually trigger Cricbuzz fetch + post simulation. Reports back to admin
+    inline (and also routes any failure through the admin alert pipeline)."""
+    if not is_admin(update.effective_chat.id):
+        return
+    await update.message.reply_text("⏳ Running healthcheck…")
+    lines = ["*Healthcheck Report*"]
+    lines.append(f"Version: `v{BOT_VERSION}`")
+    deploy_short = (RAILWAY_GIT_COMMIT_SHA or "")[:7] or "local"
+    deploy_id_short = (RAILWAY_DEPLOYMENT_ID or "")[:8] or "—"
+    lines.append(f"Deploy:  `{deploy_short}` (Railway id `{deploy_id_short}`)")
+    lines.append(f"Env:     `{RAILWAY_ENVIRONMENT_NAME or 'local'}`")
+    lines.append("")
+
+    # 1) Cricbuzz fetch
+    try:
+        matches = fetch_today_cricket_matches()
+        if matches:
+            lines.append(f"✅ Cricbuzz: {len(matches)} match(es) for today")
+            for m in matches[:5]:
+                lines.append(f"  • `{m['match_id']}` {m['team1']} vs {m['team2']} — {m['start_dt_ist'].strftime('%H:%M')} (state: {m['state']})")
+        else:
+            lines.append("⚠️ Cricbuzz: 0 matches for today")
+    except Exception as e:
+        lines.append(f"❌ Cricbuzz: {type(e).__name__}: {e}")
+
+    # 2) Posters dir
+    try:
+        per_match_count = len(list((CRICKET_DIR / "per_match").glob("*.png"))) if (CRICKET_DIR / "per_match").exists() else 0
+        generic_count = len(list(CRICKET_DIR.glob("*.png")))
+        lines.append(f"✅ Posters: {per_match_count} per-match + {generic_count} generic")
+    except Exception as e:
+        lines.append(f"❌ Posters: {type(e).__name__}: {e}")
+
+    # 3) Proofs queue
+    try:
+        queue = load_proofs_queue()
+        with db() as c:
+            sent = c.execute("SELECT COUNT(*) FROM sent_proofs").fetchone()[0]
+        remaining = max(0, len(queue) - sent)
+        lines.append(f"✅ Proofs: {remaining} remaining of {len(queue)}")
+    except Exception as e:
+        lines.append(f"❌ Proofs: {type(e).__name__}: {e}")
+
+    # 4) Telegram channel reachability
+    try:
+        chat = await ctx.application.bot.get_chat(CHANNEL)
+        lines.append(f"✅ Telegram: channel `{CHANNEL}` reachable (members ≈ {getattr(chat, 'member_count', 'n/a')})")
+    except Exception as e:
+        lines.append(f"❌ Telegram: {type(e).__name__}: {e}")
+
+    # 5) Scheduler
+    try:
+        sched = ctx.application.bot_data.get("scheduler")
+        n = len(sched.get_jobs()) if sched else 0
+        lines.append(f"✅ Scheduler: {n} jobs queued")
+    except Exception as e:
+        lines.append(f"❌ Scheduler: {type(e).__name__}: {e}")
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1628,7 +1861,9 @@ def build_scheduler() -> AsyncIOScheduler:
     return sched
 
 async def daily_self_test_job():
-    """Runs every morning at 09:00 IST. DMs admin a summary of today's queue."""
+    """Runs every morning at 09:00 IST. DMs admin a comprehensive health
+    digest: bot version, Railway deployment, Cricbuzz parser status, today's
+    full timeline, last 5 errors, last 5 fired jobs."""
     application = _APP
     if application is None:
         return
@@ -1639,19 +1874,72 @@ async def daily_self_test_job():
     if sched is None:
         return
     today = datetime.now(TZ).date()
+
+    # --- Health checks ---
+    parser_status = "unknown"
+    parser_count = 0
+    try:
+        matches = fetch_today_cricket_matches()
+        parser_count = len(matches)
+        parser_status = "ok" if matches else "empty"
+    except Exception as e:
+        parser_status = f"error ({type(e).__name__})"
+
     today_jobs = []
     for j in sched.get_jobs():
         nrt = j.next_run_time
         if nrt and nrt.astimezone(TZ).date() == today:
             today_jobs.append((nrt.astimezone(TZ).strftime("%H:%M"), j.id))
     today_jobs.sort()
-    lines = [f"☀️ *Daily Self-Test* {datetime.now(TZ).strftime('%a %d %b')}"]
+
+    uptime = datetime.now(TZ) - BOT_BOOT_TS
+    uptime_str = f"{uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds // 60) % 60}m"
+
+    deploy_short = (RAILWAY_GIT_COMMIT_SHA or "")[:7] or "local"
+    deploy_id_short = (RAILWAY_DEPLOYMENT_ID or "")[:8] or "—"
+
+    parser_emoji = {"ok": "✅", "empty": "⚠️"}.get(parser_status, "❌")
+
+    # --- Build digest ---
+    lines = [f"☀️ *Daily Self-Test* — {datetime.now(TZ).strftime('%a %d %b %Y')}"]
+    lines.append("")
+    lines.append(f"*Health Summary*")
+    lines.append(f"• Version: `v{BOT_VERSION}`")
+    lines.append(f"• Deploy:  `{deploy_short}` (Railway id `{deploy_id_short}`)")
+    lines.append(f"• Uptime:  {uptime_str}")
+    lines.append(f"• Cricbuzz: {parser_emoji} {parser_status} ({parser_count} match(es) today)")
+    lines.append("")
+
     if today_jobs:
-        lines.append(f"Today's queue ({len(today_jobs)} jobs):")
+        lines.append(f"*Today's Queue — {len(today_jobs)} posts*")
         for t, jid in today_jobs:
-            lines.append(f"  ⌛ {t} — {jid}")
+            # Strip the cricket id suffix to keep the digest readable
+            label = jid.split("::")[0] if "::" in jid else jid
+            tail = f" ({jid.split('::')[-1]})" if "::" in jid else ""
+            lines.append(f"  ⌛ {t} — {label}{tail}")
     else:
-        lines.append("⚠️ No jobs queued for today — investigate.")
+        lines.append("⚠️ *No jobs queued for today* — investigate.")
+    lines.append("")
+
+    failed = get_last_failed_jobs(5)
+    if failed:
+        lines.append("*Last 5 Failed Jobs:*")
+        for jid, fat in failed:
+            ts = datetime.fromisoformat(fat).astimezone(TZ).strftime("%d %b %H:%M")
+            lines.append(f"  ❌ {ts} — `{jid}`")
+    else:
+        lines.append("*Last 5 Failed Jobs:* none ✅")
+    lines.append("")
+
+    errors = get_last_errors(3)
+    if errors:
+        lines.append("*Recent Errors (last 3):*")
+        for occ, ctx, err in errors:
+            ts = datetime.fromisoformat(occ).astimezone(TZ).strftime("%d %b %H:%M")
+            lines.append(f"  • {ts} `{ctx}` — {err[:80]}")
+    lines.append("")
+    lines.append("_Admin commands: /status /healthcheck /list /win /loss /pause /resume_")
+
     try:
         await application.bot.send_message(
             chat_id=int(admin_id), text="\n".join(lines),
@@ -1659,6 +1947,46 @@ async def daily_self_test_job():
         )
     except Exception as e:
         log.error("Self-test DM failed: %s", e)
+
+# ---------------------------------------------------------------------------
+# RECAP HELPER (v2.6.0)
+# Fires 30 min before the auto-recap. If admin has not sent /win or /loss yet,
+# DMs admin asking them to either send it or let the auto-recap run with
+# Cricbuzz's detected result.
+# ---------------------------------------------------------------------------
+async def recap_helper_job(match_id: str):
+    job_id = f"recap_helper::{match_id}"
+    try:
+        match = get_match_from_db(match_id)
+        if not match or match.get("skipped"):
+            return
+        if cricket_post_already_sent(match_id, "recap"):
+            return
+        if match.get("tip_result") in ("win", "loss"):
+            return  # Admin already sent a verdict
+        # Try to refresh the match state to see if Cricbuzz has settled
+        try:
+            current = fetch_today_cricket_matches()
+            this = next((m for m in current if m["match_id"] == match_id), None)
+            cb_state = this.get("state") if this else "unknown"
+        except Exception:
+            cb_state = "unknown"
+        t1 = match.get("team1", "T1")
+        t2 = match.get("team2", "T2")
+        await notify_admin_async(
+            f"*Recap Helper* — {t1} vs {t2} (id `{match_id}`)\n"
+            f"Cricbuzz state: `{cb_state}`. No /win or /loss received yet.\n"
+            f"⏰ Auto-recap fires in ~30 minutes. Reply with `/win {match_id}` "
+            f"or `/loss {match_id}` to override, or do nothing for a neutral "
+            f"recap.",
+            level=ALERT_LEVEL_INFO,
+            dedupe_key=job_id,
+        )
+        log_fired_job(job_id, "ok")
+    except Exception as e:
+        log.error("Recap helper job failed for %s: %s", match_id, e)
+        log_fired_job(job_id, "error")
+        await record_failure(job_id, f"{type(e).__name__}: {e}")
 
 # ---------------------------------------------------------------------------
 # STARTUP
@@ -1721,7 +2049,7 @@ async def post_init(application):
                 proofs_sent = c.execute("SELECT COUNT(*) FROM sent_proofs").fetchone()[0]
             proofs_remaining = max(0, len(queue) - proofs_sent)
 
-            lines = [f"🚀 *GurudevBook Bot v2.2 Rebooted*"]
+            lines = [f"🚀 *GurudevBook Bot v{BOT_VERSION} Rebooted*"]
             lines.append(f"Time: {now_str}")
             lines.append(f"Active jobs in queue: {len(jobs)}")
             lines.append(f"Cricket variant locked for today: *{variant_name}* (`{variant_file}`)")
@@ -1769,6 +2097,7 @@ def main():
     for slash, kw in SLASH_TO_KEYWORD.items():
         application.add_handler(CommandHandler(slash, make_keyword_cmd(kw)))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("healthcheck", cmd_healthcheck))
     application.add_handler(CommandHandler("list", cmd_list))
     application.add_handler(CommandHandler("skip", cmd_skip))
     application.add_handler(CommandHandler("pause", cmd_pause))
@@ -1785,7 +2114,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
                                            on_text))
 
-    log.info("GurudevBook bot v2.5.1 starting. Channel=%s TZ=%s", CHANNEL, TZ_NAME)
+    log.info("GurudevBook bot v%s starting. Channel=%s TZ=%s", BOT_VERSION, CHANNEL, TZ_NAME)
     # drop_pending_updates=False so messages sent during a redeploy are NOT silently discarded
     application.run_polling(drop_pending_updates=False,
                             allowed_updates=Update.ALL_TYPES)
