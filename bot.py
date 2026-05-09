@@ -242,7 +242,9 @@ def get_last_fired_jobs(n: int = 5) -> list:
 # ---------------------------------------------------------------------------
 # CRICKET ENGINE — FIXTURE FETCHING
 # ---------------------------------------------------------------------------
-CRICBUZZ_URL = "https://www.cricbuzz.com/api/cricket-match/live-matches"
+# Primary endpoint changed/removed by Cricbuzz — HTML scrape is more stable.
+CRICBUZZ_URL = "https://www.cricbuzz.com/cricket-match/live-scores"
+CRICBUZZ_API_FALLBACK = "https://www.cricbuzz.com/api/cricket-match/live-matches"
 
 def _fetch_cricbuzz_raw() -> str:
     req = urllib.request.Request(
@@ -969,14 +971,14 @@ async def post_calendar_slot(slot_hh_mm):
         if setting_get("paused") == "1":
             log.info("Paused — skipping calendar slot %s", slot_hh_mm)
             return
-        sent_count = 0
-        with db() as c:
-            sent_count = c.execute("SELECT COUNT(*) FROM sent_posts "
-                                   "WHERE cycle=0").fetchone()[0]
-        if sent_count < len(list_prefill_in_order()):
-            log.info("Pre-fill not finished (%d/30) — skipping calendar slot",
-                     sent_count)
-            return
+        # NOTE: removed legacy guard that blocked calendar slots until ALL
+        # prefill posts had fired. With only 6 prefill posts spread across 3
+        # days at 2/day, that guard caused 18:00 + 21:30 calendar slots to
+        # silently skip on Day 1–3 — a 3-day blackout. Calendar slots now
+        # fire from Day 1 alongside the prefill rollout. The prefill posts
+        # use slots 10:00 + 13:00 (with +7 offsets), so they don't collide
+        # with calendar slots 18:00 + 21:30.
+        pass
         if not setting_get("calendar_start_date"):
             setting_set("calendar_start_date",
                         datetime.now(TZ).date().isoformat())
@@ -1596,7 +1598,48 @@ def build_scheduler() -> AsyncIOScheduler:
         )
         log.info("Scheduled daily proof slot %02d:%02d IST", hh, mm)
 
+    # 5) Daily 09:00 IST self-test — DMs admin a summary of today's queue.
+    sched.add_job(
+        daily_self_test_job, CronTrigger(hour=9, minute=0, timezone=TZ),
+        args=[], id="daily_self_test",
+        replace_existing=True, misfire_grace_time=600
+    )
+    log.info("Scheduled daily self-test at 09:00 IST")
+
     return sched
+
+async def daily_self_test_job():
+    """Runs every morning at 09:00 IST. DMs admin a summary of today's queue."""
+    application = _APP
+    if application is None:
+        return
+    admin_id = setting_get("admin_chat_id")
+    if not admin_id:
+        return
+    sched = application.bot_data.get("scheduler")
+    if sched is None:
+        return
+    today = datetime.now(TZ).date()
+    today_jobs = []
+    for j in sched.get_jobs():
+        nrt = j.next_run_time
+        if nrt and nrt.astimezone(TZ).date() == today:
+            today_jobs.append((nrt.astimezone(TZ).strftime("%H:%M"), j.id))
+    today_jobs.sort()
+    lines = [f"☀️ *Daily Self-Test* {datetime.now(TZ).strftime('%a %d %b')}"]
+    if today_jobs:
+        lines.append(f"Today's queue ({len(today_jobs)} jobs):")
+        for t, jid in today_jobs:
+            lines.append(f"  ⌛ {t} — {jid}")
+    else:
+        lines.append("⚠️ No jobs queued for today — investigate.")
+    try:
+        await application.bot.send_message(
+            chat_id=int(admin_id), text="\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        log.error("Self-test DM failed: %s", e)
 
 # ---------------------------------------------------------------------------
 # STARTUP
@@ -1628,6 +1671,21 @@ async def post_init(application):
     sched = build_scheduler()
     sched.start()
     application.bot_data["scheduler"] = sched
+
+    # Boot health log: print every job's next_run_time so we can verify in
+    # Railway logs that all expected jobs are queued and timezone is correct.
+    try:
+        all_jobs = sorted(sched.get_jobs(),
+                          key=lambda j: j.next_run_time or datetime.max.replace(tzinfo=TZ))
+        log.info("=" * 60)
+        log.info("BOOT HEALTH — %d jobs scheduled (TZ=%s):", len(all_jobs), TZ_NAME)
+        for j in all_jobs:
+            nrt = j.next_run_time
+            nrt_str = nrt.astimezone(TZ).strftime("%a %d %b %H:%M %Z") if nrt else "(paused)"
+            log.info("  • %-40s next=%s", j.id, nrt_str)
+        log.info("=" * 60)
+    except Exception as e:
+        log.error("Boot health log failed: %s", e)
 
     # Admin notification on boot
     admin_id = setting_get("admin_chat_id")
