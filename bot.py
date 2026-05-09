@@ -278,11 +278,29 @@ def _is_relevant_series(series_name: str, slug: str = "") -> bool:
         return True
     return False
 
+# JSON-payload parser (v2.5.1): Cricbuzz embeds matchInfo as escaped JSON
+# inside __next_f.push payloads. Each match block has matchId/seriesId/seriesName/
+# matchDesc/matchFormat/startDate(int)/endDate(int)/state/status/team1/team2/venueInfo.
+_CRICBUZZ_MATCH_RE = re.compile(
+    r'\\"matchId\\":(\d+),'
+    r'\\"seriesId\\":(\d+),'
+    r'\\"seriesName\\":\\"([^"\\]+)\\",'
+    r'\\"matchDesc\\":\\"([^"\\]+)\\",'
+    r'\\"matchFormat\\":\\"([^"\\]+)\\",'
+    r'\\"startDate\\":(\d+),'
+    r'\\"endDate\\":(\d+),'
+    r'\\"state\\":\\"([^"\\]*)\\",'
+    r'\\"status\\":\\"([^"\\]*)\\",'
+    r'\\"team1\\":\{\\"teamId\\":\d+,\\"teamName\\":\\"([^"\\]+)\\",\\"teamSName\\":\\"([^"\\]+)\\"[^}]*?\},'
+    r'\\"team2\\":\{\\"teamId\\":\d+,\\"teamName\\":\\"([^"\\]+)\\",\\"teamSName\\":\\"([^"\\]+)\\"[^}]*?\},'
+    r'\\"venueInfo\\":\{[^}]*?\\"ground\\":\\"([^"\\]+)\\",\\"city\\":\\"([^"\\]+)\\"'
+)
+
 def fetch_today_cricket_matches() -> list[dict]:
     """
-    Returns a list of match dicts for today (IST) that are relevant
-    (IPL, international, major T20 leagues).
-    Each dict: {match_id, series, team1, team2, venue, start_ts, state}
+    Returns a list of match dicts for today (IST) that are relevant (IPL only
+    in the current window; whitelist via CRICKET_SERIES_KEYWORDS).
+    Parsed from Cricbuzz's embedded JSON payload (v2.5.1 robust parser).
     """
     today_ist = datetime.now(TZ).date()
     try:
@@ -291,102 +309,47 @@ def fetch_today_cricket_matches() -> list[dict]:
         log.error("Cricbuzz fetch failed: %s", e)
         return []
 
+    raw_matches = _CRICBUZZ_MATCH_RE.findall(raw)
+    log.info("Cricbuzz parser found %d raw match blocks", len(raw_matches))
+
     matches = []
-    # Extract match info from the HTML/JSON hybrid response
-    # Pattern: href="/live-cricket-scores/<id>/<slug>" title="<desc>"
-    match_links = re.findall(
-        r'href="(/live-cricket-scores/(\d+)/([^"]+))"[^>]*title="([^"]*)"',
-        raw
-    )
+    for tup in raw_matches:
+        (mid, sid, sname, desc, fmt, startms, endms, state_str, status_str,
+         t1n, t1s, t2n, t2s, ground, city) = tup
 
-    # Also extract series context by looking for series name before each match block
-    # We'll use a simpler approach: find startDate timestamps near match IDs
-    # Extract all startDate values with their surrounding context
-    start_date_pattern = re.compile(r'"startDate":"(\d+)"')
-    all_timestamps = [(int(m.group(1)), m.start()) for m in start_date_pattern.finditer(raw)]
-
-    for href, match_id, slug, title in match_links:
-        if not title.strip():
+        # Whitelist filter (IPL etc.)
+        if not _is_relevant_series(sname, sname.lower().replace(" ", "-")):
             continue
 
-        # Parse teams from slug: e.g. "dc-vs-kkr-51st-match-ipl-2026"
-        slug_parts = slug.split("-")
-        vs_idx = None
-        for i, p in enumerate(slug_parts):
-            if p == "vs":
-                vs_idx = i
-                break
+        start_ts = int(startms)
+        start_dt_ist = datetime.fromtimestamp(start_ts / 1000, tz=pytz.utc).astimezone(TZ)
 
-        if vs_idx and vs_idx >= 1:
-            team1 = " ".join(slug_parts[:vs_idx]).upper()
-            # team2 ends before the match number
-            team2_parts = []
-            for p in slug_parts[vs_idx+1:]:
-                if re.match(r'^\d+', p) or p in ("match", "test", "odi", "t20i",
-                                                   "ipl", "bbl", "psl"):
-                    break
-                team2_parts.append(p)
-            team2 = " ".join(team2_parts).upper()
-        else:
-            team1 = "Team 1"
-            team2 = "Team 2"
-
-        # Determine series from slug tail
-        series = slug.replace("-", " ").title()
-        if not _is_relevant_series(series, slug):
-            continue
-
-        # Find the closest startDate timestamp to this match_id in the raw text
-        match_id_pos = raw.find(f'/{match_id}/')
-        start_ts = None
-        if match_id_pos > 0:
-            # Find nearest startDate within 3000 chars before
-            nearby = raw[max(0, match_id_pos-3000):match_id_pos+200]
-            ts_matches = re.findall(r'"startDate":"(\d+)"', nearby)
-            if ts_matches:
-                start_ts = int(ts_matches[-1])
-
-        if not start_ts:
-            # Skip if we can't determine time
-            continue
-
-        # Convert to IST
-        start_dt_utc = datetime.fromtimestamp(start_ts / 1000, tz=pytz.utc)
-        start_dt_ist = start_dt_utc.astimezone(TZ)
-
-        # Only include today's matches
+        # Only include matches scheduled to start today (IST)
         if start_dt_ist.date() != today_ist:
             continue
 
-        # Determine state from title
-        title_lower = title.lower()
-        if "complete" in title_lower or "won" in title_lower:
+        sl = state_str.lower()
+        if "complete" in sl or "won" in status_str.lower():
             state = "complete"
-        elif "live" in title_lower or "toss" in title_lower or "innings" in title_lower:
+        elif sl in ("in progress", "toss", "innings break", "stumps", "tea", "lunch"):
             state = "live"
-        elif "preview" in title_lower or "upcoming" in title_lower:
+        elif sl in ("preview", "upcoming"):
             state = "upcoming"
         else:
             state = "scheduled"
 
-        # Extract venue from title if possible
-        venue = "TBD"
-        # Title format: "Team1 vs Team2, Match Desc - Status"
-        # Venue is usually in a separate field; we'll use city from slug context
-        city_match = re.search(r'"city":"([^"]+)"', raw[max(0,match_id_pos-500):match_id_pos+500])
-        if city_match:
-            venue = city_match.group(1)
-
         matches.append({
-            "match_id": match_id,
-            "series": series,
-            "team1": team1,
-            "team2": team2,
-            "venue": venue,
+            "match_id": mid,
+            "series": sname,
+            "team1": t1s.upper(),
+            "team2": t2s.upper(),
+            "team1_full": t1n,
+            "team2_full": t2n,
+            "venue": f"{ground}, {city}" if ground else city,
             "start_ts": start_ts,
             "start_dt_ist": start_dt_ist,
             "state": state,
-            "title": title.strip(),
+            "title": f"{t1n} vs {t2n}, {desc}",
         })
 
     # Deduplicate by match_id
@@ -1822,7 +1785,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
                                            on_text))
 
-    log.info("GurudevBook bot v2.2.1 starting. Channel=%s TZ=%s", CHANNEL, TZ_NAME)
+    log.info("GurudevBook bot v2.5.1 starting. Channel=%s TZ=%s", CHANNEL, TZ_NAME)
     # drop_pending_updates=False so messages sent during a redeploy are NOT silently discarded
     application.run_polling(drop_pending_updates=False,
                             allowed_updates=Update.ALL_TYPES)
