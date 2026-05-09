@@ -80,10 +80,13 @@ SLOTS = [(10, 0), (13, 0), (18, 0), (21, 30)]
 PREFILL_ROLLOUT_DAYS = 3
 PREFILL_PER_DAY = [2, 2, 2]
 
-# Cricket poster rotation — 3 templates baked into content/cricket/
+# Cricket poster rotation — generic fallback templates baked into content/cricket/
 CRICKET_VARIANTS = ["variant1.png", "variant3.png", "variant4.png"]
 CRICKET_VARIANT_NAMES = ["V1 Play Big / Win Big", "V3 Versus Showdown", "V4 Live Now"]
 CRICKET_DIR_NAME = "cricket"
+# Per-match high-resolution posters live here, named match{N}_{A}_vs_{B}_v{V}.png
+# Built per-match with correct captains (e.g. match53_CSK_vs_LSG_v3.png).
+PER_MATCH_POSTER_DIR = CONTENT_DIR / "cricket" / "per_match"
 
 # Real proofs queue (separate channel)
 PROOFS_QUEUE_FILE_NAME = "proofs_queue.json"
@@ -97,18 +100,14 @@ SLOT_TIME_MAP = {
     "2130": (21, 30),
 }
 
-# Cricket league whitelist: IPL 2026 + India national-team internationals only.
-# Skip everything else (PSL, BBL, CPL, county, women's non-India, qualifiers,
-# T20I tours not involving India).
+# Cricket league whitelist (May 10–16 window): **IPL 2026 ONLY**.
+# India-internationals scope dropped per ops decision — no India tour active in this window.
+# Skip everything else (PSL, BBL, CPL, county, women's non-India, qualifiers, all bilateral tours).
 CRICKET_SERIES_KEYWORDS = [
     "ipl", "indian premier league",
 ]
-# Series patterns that ALSO qualify as India-internationals (slug must contain one of these)
-INDIA_INTERNATIONAL_KEYWORDS = [
-    "india tour", "tour of india",
-    "india vs", "vs india",
-    "asia cup", "world cup", "champions trophy",
-]
+# India-internationals filter retained as empty list (no-op) so downstream code stays compatible.
+INDIA_INTERNATIONAL_KEYWORDS = []
 # Hard cap: max 2 cricket matches scheduled per day (avoids channel spam).
 CRICKET_MAX_MATCHES_PER_DAY = int(os.environ.get("CRICKET_MAX_MATCHES_PER_DAY", "2"))
 # Minimum spacing between two adjacent cricket posts (seconds)
@@ -415,6 +414,24 @@ def cricket_variant_for_match(match_id: str) -> tuple[int, str, str]:
     idx = h % len(CRICKET_VARIANTS)
     return idx, CRICKET_VARIANTS[idx], CRICKET_VARIANT_NAMES[idx]
 
+def per_match_poster_path(match: dict) -> Optional[Path]:
+    """Return the high-res per-match poster path if one exists for this match.
+    Filename pattern: match{N}_{TEAM_A}_vs_{TEAM_B}_v{V}.png
+    Looks up by team-code pair (order-insensitive); falls back to None so
+    callers can use the generic CRICKET_VARIANTS rotation.
+    """
+    if not PER_MATCH_POSTER_DIR.exists():
+        return None
+    t1 = (match.get("team1") or "").split()[0].upper()
+    t2 = (match.get("team2") or "").split()[0].upper()
+    if not t1 or not t2:
+        return None
+    # Try both orderings (A_vs_B and B_vs_A)
+    for a, b in ((t1, t2), (t2, t1)):
+        for f in PER_MATCH_POSTER_DIR.glob(f"match*_{a}_vs_{b}_v*.png"):
+            return f
+    return None
+
 def save_match_to_db(match: dict):
     with db() as c:
         c.execute("""
@@ -628,10 +645,14 @@ async def post_text_to_channel(text: str, match_id: str, post_type: str):
         log.info("Cricket post %s/%s already sent", match_id, post_type)
         return
     try:
-        # Per-match poster rotation (V1/V3/V4 by hash of match_id)
-        # so multiple matches on the same day get visually distinct posters.
-        _, variant_file, _ = cricket_variant_for_match(match_id)
-        poster_path = CRICKET_DIR / variant_file
+        # 1) Try high-res per-match poster (correct captains, venue, date, V1/V3/V4 baked-in)
+        # 2) Fall back to generic V1/V3/V4 rotation if no per-match poster on disk.
+        match_row = get_match_from_db(match_id) or {}
+        poster_path = per_match_poster_path(match_row)
+        variant_file = poster_path.name if poster_path else None
+        if poster_path is None:
+            _, variant_file, _ = cricket_variant_for_match(match_id)
+            poster_path = CRICKET_DIR / variant_file
         if poster_path.exists():
             with open(poster_path, "rb") as fh:
                 msg = await application.bot.send_photo(
