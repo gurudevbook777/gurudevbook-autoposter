@@ -55,7 +55,7 @@ _APP = None   # set in post_init before scheduler starts
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-BOT_VERSION = "2.6.3"
+BOT_VERSION = "2.6.4"
 RAILWAY_DEPLOYMENT_ID = os.environ.get("RAILWAY_DEPLOYMENT_ID", "")
 RAILWAY_GIT_COMMIT_SHA = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
 RAILWAY_ENVIRONMENT_NAME = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "")
@@ -348,6 +348,73 @@ def _fetch_cricbuzz_raw() -> str:
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+# v2.6.4: per-match scorecard fetcher for real recap captions.
+# Hits https://www.cricbuzz.com/live-cricket-scores/{match_id}/{slug}
+# and pulls winner + margin + Player of the Match from the rendered HTML.
+def _build_match_url(match_id: str, team1_short: str, team2_short: str, match_desc: str = "") -> str:
+    """Build a best-guess Cricbuzz match URL. Cricbuzz redirects to the canonical
+    slug on its own, so a stub like 'lsg-vs-csk' is enough for the page to load."""
+    t1 = (team1_short or "").lower().strip()
+    t2 = (team2_short or "").lower().strip()
+    slug = f"{t1}-vs-{t2}-match"
+    return f"https://www.cricbuzz.com/live-cricket-scores/{match_id}/{slug}"
+
+def fetch_match_scorecard(match_id: str, team1_short: str = "", team2_short: str = "",
+                          retries: int = 3) -> Optional[dict]:
+    """v2.6.4: Fetch a match's final scorecard from Cricbuzz.
+    Returns dict with winner, margin, motm — or None if all retries fail or
+    the match is not yet complete.
+    """
+    url = _build_match_url(match_id, team1_short, team2_short)
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+            # Find any "...won by N runs|wkts" status in the embedded JSON.
+            # Pattern matches escaped (\") and unescaped (") quote forms.
+            won_re = re.compile(r'\\?"status\\?":\\?"([^"\\]*won by [^"\\]+)\\?"')
+            won_matches = won_re.findall(html)
+            winner_status = None
+            for s in won_matches:
+                # Pick the status that mentions one of our team's full or short name
+                if not (team1_short and team2_short):
+                    winner_status = s
+                    break
+                low = s.lower()
+                if team1_short.lower() in low or team2_short.lower() in low:
+                    winner_status = s
+                    break
+            if not winner_status and won_matches:
+                winner_status = won_matches[-1]  # last status is usually current match
+            if not winner_status:
+                # Match may still be live or rained off; treat as no-data
+                return None
+            # Extract winner team and margin
+            m = re.match(r'(.+?) won by (.+)', winner_status)
+            if not m:
+                return None
+            winner = m.group(1).strip()
+            margin = m.group(2).strip()
+            # Extract Player of the Match if present
+            motm = None
+            pom_match = re.search(r'PLAYER OF THE MATCH</div><div><a title="View Profile Of ([^"]+)"', html)
+            if pom_match:
+                motm = pom_match.group(1).strip()
+            return {"winner": winner, "margin": margin, "motm": motm}
+        except Exception as e:
+            last_err = e
+            log.warning("fetch_match_scorecard attempt %d failed for %s: %s",
+                        attempt, match_id, e)
+            continue
+    log.error("fetch_match_scorecard giving up for %s after %d retries: %s",
+              match_id, retries, last_err)
+    return None
 
 def _is_relevant_series(series_name: str, slug: str = "") -> bool:
     """
@@ -689,15 +756,27 @@ def make_live_alert_caption(match: dict) -> str:
         f"#CricketLive"
     )
 
-def make_recap_caption(match: dict, result: Optional[str] = None) -> str:
+def make_recap_caption(match: dict, result: Optional[str] = None,
+                       scorecard: Optional[dict] = None) -> str:
+    """v2.6.4: builds recap caption.
+    - If `result` is 'win'/'loss' (admin /win or /loss override), use the
+      tip-centric template.
+    - If `scorecard` dict is provided (winner/margin/motm), use the data-rich
+      auto-recap template.
+    - If neither, returns None (caller should skip the post; no lazy fallback).
+    """
     t1 = _team_display(match["team1"].split()[0])
     t2 = _team_display(match["team2"].split()[0])
     tip_text = match.get("tip_text") or f"{t1} Win"
 
     if result == "win":
+        scoreline = ""
+        if scorecard:
+            scoreline = (f"\nFinal: {scorecard['winner']} won by {scorecard['margin']}\n"
+                         f"Player of the Match: {scorecard.get('motm') or 'TBA'}\n")
         return (
             f"TIP HIT — {t1} vs {t2}\n\n"
-            f"Hamara pick '{tip_text}' — CORRECT!\n\n"
+            f"Hamara pick '{tip_text}' — CORRECT!{scoreline}\n"
             f"Bhaiyo, aaj ke VIP members ne mast return banaya. "
             f"Kal ka combo bhi is channel par aayega.\n\n"
             f"Abhi tak join nahi kiya? Kal miss mat karo:\n"
@@ -707,9 +786,13 @@ def make_recap_caption(match: dict, result: Optional[str] = None) -> str:
             f"#{t1.replace(' ','')}vs{t2.replace(' ','')} #VIPLife"
         )
     elif result == "loss":
+        scoreline = ""
+        if scorecard:
+            scoreline = (f"\nFinal: {scorecard['winner']} won by {scorecard['margin']}\n"
+                         f"Player of the Match: {scorecard.get('motm') or 'TBA'}\n")
         return (
             f"MATCH RESULT — {t1} vs {t2}\n\n"
-            f"Aaj ka pick '{tip_text}' — result expected ke against gaya.\n\n"
+            f"Aaj ka pick '{tip_text}' — result expected ke against gaya.{scoreline}\n"
             f"Cricket mein upsets hote hain — yahi game hai. "
             f"Hamari team kal fresh analysis ke saath wapas aayegi. "
             f"Long-term mein consistency hi winner banati hai.\n\n"
@@ -719,18 +802,36 @@ def make_recap_caption(match: dict, result: Optional[str] = None) -> str:
             f"#GurudevBook #HonestTipper "
             f"#{t1.replace(' ','')}vs{t2.replace(' ','')} #CricketAnalysis"
         )
-    else:
-        # Neutral recap (no admin response)
+    elif scorecard:
+        # Auto-recap with real scorecard data (no admin override)
+        winner = scorecard["winner"]
+        margin = scorecard["margin"]
+        motm = scorecard.get("motm") or "TBA"
+        # Was our tip a hit?
+        tip_team = (match.get("tip_text") or "").replace(" Win", "").strip().lower()
+        tip_hit_line = ""
+        if tip_team and tip_team in winner.lower():
+            tip_hit_line = f"Hamara VIP pick: {tip_text} — HIT ✅\n"
+        elif tip_team:
+            tip_hit_line = f"Hamara VIP pick: {tip_text} — miss ho gaya. Tomorrow's analysis aur sharp hoga.\n"
         return (
-            f"MATCH OVER — {t1} vs {t2}\n\n"
-            f"Match khatam ho gaya. Full result aur analysis kal subah "
-            f"channel par share kiya jayega.\n\n"
-            f"Daily VIP tips ke liye channel subscribe karein:\n"
+            f"FULL TIME — {t1} vs {t2}\n\n"
+            f"🏆 {winner} won by {margin}\n"
+            f"🏅 Player of the Match: {motm}\n\n"
+            f"{tip_hit_line}"
+            f"Bhaiyo, har match ek learning hai. Kal ka VIP combo aur analysis "
+            f"is channel par fresh drop hoga — channel UNMUTE rakho.\n\n"
+            f"Daily VIP tips ke liye register karein:\n"
             f"{REGISTER_URL}\n"
             f"WhatsApp: {WHATSAPP_LINK}\n\n"
-            f"#GurudevBook #{t1.replace(' ','')}vs{t2.replace(' ','')} "
-            f"#CricketResults"
+            f"Responsible gaming karein. 18+ only.\n"
+            f"#FullTime #GurudevBook #{t1.replace(' ','')}vs{t2.replace(' ','')} "
+            f"#CricketRecap"
         )
+    else:
+        # No admin override AND no scorecard data — return None so caller
+        # can SKIP posting and DM admin instead. No more lazy fallback.
+        return None
 
 # ---------------------------------------------------------------------------
 # CRICKET SCHEDULER
@@ -840,9 +941,12 @@ async def cricket_live_alert_job(match_id: str):
         await record_failure(job_id, f"{type(e).__name__}: {e}")
 
 async def cricket_recap_job(match_id: str):
-    """
-    Fires ~2 hours after match start. Checks if admin sent /win or /loss.
-    If not, posts neutral recap.
+    """v2.6.4: Fires ~2 hours after match start.
+    Priority order:
+      1. Admin /win or /loss override → use tip-centric template (with scorecard
+         data if available)
+      2. Auto-recap from Cricbuzz scorecard (winner, margin, MoM)
+      3. SKIP — no lazy fallback. DM admin to send /recap manually.
     """
     job_id = f"cricket_recap::{match_id}"
     try:
@@ -854,7 +958,26 @@ async def cricket_recap_job(match_id: str):
         if setting_get("cricket_paused") == "1":
             return
         result = match.get("tip_result")  # "win", "loss", or None
-        caption = make_recap_caption(match, result)
+
+        # Try to get a real scorecard from Cricbuzz (3 retries)
+        team1_short = (match.get("team1_short") or match["team1"].split()[0]).lower()
+        team2_short = (match.get("team2_short") or match["team2"].split()[0]).lower()
+        scorecard = fetch_match_scorecard(match_id, team1_short, team2_short, retries=3)
+
+        caption = make_recap_caption(match, result, scorecard=scorecard)
+        if not caption:
+            # No admin override AND no scorecard — SKIP. No lazy fallback.
+            t1 = _team_display(match["team1"].split()[0])
+            t2 = _team_display(match["team2"].split()[0])
+            await notify_admin_async(
+                f"⚠️ Match recap SKIPPED — Cricbuzz fetch failed for {t1} vs {t2} "
+                f"(match {match_id}). Send `/recap <text>` manually if needed, "
+                f"or send `/win <team>` / `/loss <team>` to use the tip-centric template.",
+                level=ALERT_LEVEL_WARN,
+                dedupe_key=f"recap_skip::{match_id}",
+            )
+            log_fired_job(job_id, "skipped")
+            return
         await post_text_to_channel(caption, match_id, "recap")
         log_fired_job(job_id, "ok")
     except Exception as e:
@@ -1538,7 +1661,11 @@ async def cmd_win(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                   "WHERE match_id=?", (match_id,))
     match = get_match_from_db(match_id)
     if match:
-        caption = make_recap_caption(match, "win")
+        # Try to enrich with real scorecard
+        t1s = (match.get("team1_short") or match["team1"].split()[0]).lower()
+        t2s = (match.get("team2_short") or match["team2"].split()[0]).lower()
+        scorecard = fetch_match_scorecard(match_id, t1s, t2s, retries=2)
+        caption = make_recap_caption(match, "win", scorecard=scorecard)
         await post_text_to_channel(caption, match_id, "recap")
         await update.message.reply_text(
             f"Win marked for {match_id}. Recap post sent to channel!")
@@ -1558,12 +1685,78 @@ async def cmd_loss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                   "WHERE match_id=?", (match_id,))
     match = get_match_from_db(match_id)
     if match:
-        caption = make_recap_caption(match, "loss")
+        t1s = (match.get("team1_short") or match["team1"].split()[0]).lower()
+        t2s = (match.get("team2_short") or match["team2"].split()[0]).lower()
+        scorecard = fetch_match_scorecard(match_id, t1s, t2s, retries=2)
+        caption = make_recap_caption(match, "loss", scorecard=scorecard)
         await post_text_to_channel(caption, match_id, "recap")
         await update.message.reply_text(
             f"Loss marked for {match_id}. Recap post sent to channel.")
     else:
         await update.message.reply_text(f"Match {match_id} nahi mila database mein.")
+
+async def cmd_recap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """v2.6.4: Manual recap when Cricbuzz auto-fetch failed.
+    Usage:
+      /recap                           → try auto-fetch latest match's scorecard
+      /recap <match_id>                → same, but for a specific match
+      /recap <free-text recap>         → post the free-text as the recap caption
+      /recap <match_id> <free-text>    → same, with explicit match_id
+    """
+    if not is_admin(update.effective_chat.id):
+        return
+    args = ctx.args or []
+    # Distinguish: numeric first arg = match_id, otherwise treat all as free text
+    match_id = None
+    free_text = ""
+    if args and args[0].isdigit():
+        match_id = args[0]
+        free_text = " ".join(args[1:]).strip()
+    elif args:
+        free_text = " ".join(args).strip()
+    if not match_id:
+        match_id = get_latest_match_id()
+    if not match_id:
+        await update.message.reply_text("Koi match nahi mila. Match ID specify karein.")
+        return
+    match = get_match_from_db(match_id)
+    if not match:
+        await update.message.reply_text(f"Match {match_id} nahi mila database mein.")
+        return
+    if free_text:
+        # Free-text override — wrap in standard branding
+        t1 = _team_display(match["team1"].split()[0])
+        t2 = _team_display(match["team2"].split()[0])
+        caption = (
+            f"FULL TIME — {t1} vs {t2}\n\n"
+            f"{free_text}\n\n"
+            f"Daily VIP tips ke liye register karein:\n"
+            f"{REGISTER_URL}\n"
+            f"WhatsApp: {WHATSAPP_LINK}\n\n"
+            f"Responsible gaming karein. 18+ only.\n"
+            f"#FullTime #GurudevBook #{t1.replace(' ','')}vs{t2.replace(' ','')} #CricketRecap"
+        )
+        await post_text_to_channel(caption, match_id, "recap")
+        await update.message.reply_text(
+            f"Manual recap posted to channel for match {match_id}.")
+        return
+    # Auto path — fetch and post
+    t1s = (match.get("team1_short") or match["team1"].split()[0]).lower()
+    t2s = (match.get("team2_short") or match["team2"].split()[0]).lower()
+    scorecard = fetch_match_scorecard(match_id, t1s, t2s, retries=3)
+    if not scorecard:
+        await update.message.reply_text(
+            f"Cricbuzz scorecard not available yet for match {match_id}. "
+            f"Try again in a few minutes, or use:\n"
+            f"  /recap {match_id} <your text>\n"
+            f"  /win {match_id}\n"
+            f"  /loss {match_id}")
+        return
+    caption = make_recap_caption(match, None, scorecard=scorecard)
+    await post_text_to_channel(caption, match_id, "recap")
+    await update.message.reply_text(
+        f"Recap posted: {scorecard['winner']} won by {scorecard['margin']} "
+        f"(MoM: {scorecard.get('motm') or 'TBA'}).")
 
 async def cmd_skiptip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id):
@@ -2216,6 +2409,7 @@ def main():
     application.add_handler(CommandHandler("todaymatches", cmd_todaymatches))
     application.add_handler(CommandHandler("win", cmd_win))
     application.add_handler(CommandHandler("loss", cmd_loss))
+    application.add_handler(CommandHandler("recap", cmd_recap))
     application.add_handler(CommandHandler("skiptip", cmd_skiptip))
     application.add_handler(CommandHandler("forcematch", cmd_forcematch))
 
