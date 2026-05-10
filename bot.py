@@ -55,7 +55,7 @@ _APP = None   # set in post_init before scheduler starts
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-BOT_VERSION = "2.6.1"
+BOT_VERSION = "2.6.2"
 RAILWAY_DEPLOYMENT_ID = os.environ.get("RAILWAY_DEPLOYMENT_ID", "")
 RAILWAY_GIT_COMMIT_SHA = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
 RAILWAY_ENVIRONMENT_NAME = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "")
@@ -469,18 +469,68 @@ def per_match_poster_path(match: dict) -> Optional[Path]:
     Filename pattern: match{N}_{TEAM_A}_vs_{TEAM_B}_v{V}.png
     Looks up by team-code pair (order-insensitive); falls back to None so
     callers can use the generic CRICKET_VARIANTS rotation.
+
+    v2.6.2: SAFETY CHECK — the chosen poster's filename MUST mention BOTH team
+    codes from the match record. If a candidate filename was found but doesn't
+    contain both codes, we refuse it and return None (forcing generic fallback)
+    rather than risk serving a wrong-match poster.
     """
     if not PER_MATCH_POSTER_DIR.exists():
         return None
-    t1 = (match.get("team1") or "").split()[0].upper()
-    t2 = (match.get("team2") or "").split()[0].upper()
+    # Normalize team codes — canonical IPL 3-letter codes
+    t1_full = (match.get("team1") or "").upper()
+    t2_full = (match.get("team2") or "").upper()
+    t1 = _canon_team_code(t1_full)
+    t2 = _canon_team_code(t2_full)
     if not t1 or not t2:
         return None
     # Try both orderings (A_vs_B and B_vs_A)
+    candidate = None
     for a, b in ((t1, t2), (t2, t1)):
         for f in PER_MATCH_POSTER_DIR.glob(f"match*_{a}_vs_{b}_v*.png"):
-            return f
-    return None
+            candidate = f
+            break
+        if candidate:
+            break
+    if not candidate:
+        return None
+    # Safety check: filename must contain BOTH team codes
+    name_upper = candidate.name.upper()
+    if t1 not in name_upper or t2 not in name_upper:
+        # Refuse mismatched poster, fire admin alert, fall back to generic
+        try:
+            notify_admin_sync(
+                f"⚠️ Poster filename mismatch refused: `{candidate.name}` "
+                f"vs match teams `{t1}` / `{t2}`. Falling back to generic.",
+                level=ALERT_LEVEL_WARN,
+                dedupe_key=f"poster_mismatch::{match.get('match_id')}",
+            )
+        except Exception:
+            pass
+        return None
+    return candidate
+
+# Canonical IPL team code mapping. Cricbuzz/match feed team names sometimes
+# come through as full names ("Chennai Super Kings") rather than codes ("CSK").
+# v2.6.2: explicit lookup so the poster filename match is unambiguous.
+_TEAM_CODE_MAP = {
+    # Direct codes
+    "CSK": "CSK", "LSG": "LSG", "RCB": "RCB", "MI": "MI",
+    "PBKS": "PBKS", "DC": "DC", "GT": "GT", "SRH": "SRH",
+    "KKR": "KKR", "RR": "RR",
+    # Full-name variants
+    "CHENNAI": "CSK", "LUCKNOW": "LSG", "BANGALORE": "RCB",
+    "BENGALURU": "RCB", "MUMBAI": "MI", "PUNJAB": "PBKS",
+    "DELHI": "DC", "GUJARAT": "GT", "HYDERABAD": "SRH",
+    "SUNRISERS": "SRH", "KOLKATA": "KKR", "RAJASTHAN": "RR",
+}
+
+def _canon_team_code(name: str) -> str:
+    """Map a Cricbuzz team name to its canonical IPL code."""
+    if not name:
+        return ""
+    first_word = name.upper().split()[0]
+    return _TEAM_CODE_MAP.get(first_word, first_word)
 
 def save_match_to_db(match: dict):
     with db() as c:
