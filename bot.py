@@ -55,7 +55,7 @@ _APP = None   # set in post_init before scheduler starts
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-BOT_VERSION = "2.6.2"
+BOT_VERSION = "2.6.3"
 RAILWAY_DEPLOYMENT_ID = os.environ.get("RAILWAY_DEPLOYMENT_ID", "")
 RAILWAY_GIT_COMMIT_SHA = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
 RAILWAY_ENVIRONMENT_NAME = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "")
@@ -643,7 +643,7 @@ def make_preview_caption(match: dict) -> str:
         f"head-to-head stats analyze kar rahi hai.\n\n"
         f"VIP combo pick aaj match se 30 min pehle is channel par drop hoga. "
         f"Channel UNMUTE rakho!\n\n"
-        f"Abhi register karo — 100% welcome bonus + 1 free VIP tip:\n"
+        f"Abhi register karo — 30% welcome bonus + 5% recurring on every deposit:\n"
         f"{REGISTER_URL}\n"
         f"WhatsApp: {WHATSAPP_LINK}\n\n"
         f"#GurudevBook #{t1.replace(' ','')} #{t2.replace(' ','')} "
@@ -1254,7 +1254,7 @@ HELP_TEXT = (
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Welcome to GurudevBook VIP Support!\n\n"
-        f"100% welcome bonus claim karne ke liye yahan register karein:\n"
+        f"30% welcome bonus + 5% recurring deposit bonus claim karne ke liye yahan register karein:\n"
         f"{REGISTER_URL}\n\n"
         "Type 'tips', 'casino', 'bonus' or 'support' for quick info.\n"
         "Admins: send /claim from your personal chat to gain control."
